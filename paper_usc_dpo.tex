@@ -43,10 +43,9 @@
 
 \newcommand{\valid}{\texttt{<|step\_\allowbreak valid|>}}
 \newcommand{\invalid}{\texttt{<|step\_\allowbreak invalid|>}}
-\newcommand{\soldpo}{\textsc{Sol-DPO}}
+\newcommand{\soldpo}{USC-DPO-S1}
 
-\title{\textbf{Learning to Verify: Self-Verification Training for Small Reasoning Models}\\[4pt]
-\large Framework Design and a Solution-Level DPO Pilot Study}
+\title{\textbf{Learning to Verify: Self-Verification Training for Small Reasoning Models}}
 
 \author{
     \textbf{Dinh-Hong Vu}$^{1[0000-0001-8513-3942]}$,
@@ -65,7 +64,7 @@
 \maketitle
 
 \begin{abstract}
-Small Language Models (SLMs) are attractive for on-device deployment, yet they fail on multi-step reasoning because errors compound along the chain of thought. External verifiers roughly double resident memory and add latency, and prompted self-correction is unreliable and verbose. We specify USC-DPO (Unified Step-Filtered Contrastive Direct Preference Optimization), a framework that places the \textit{Solve}, \textit{Verify} and \textit{Correct} phases in a single set of weights. Its components are discrete status tokens emitted after each step, Hard Context Truncation of rejected steps in the KV cache, and the Local Contrastive Preference (LCP) procedure, which turns the model's own solutions into step-aligned pairs for content and balanced pairs for verification. We revise our earlier objective, which attached the error tag to the rejected sample and therefore taught the model \emph{not} to flag its errors, and we give a finite-budget analysis that links verifier recall and false-alarm rate to end-to-end accuracy. This report does \emph{not} yet evaluate USC-DPO. Its two pilots train plain solution-level DPO (\soldpo{}) on Qwen2.5-Math-1.5B. In the larger pilot (146 pairs, 100 GSM8K test problems), \soldpo{} scores 68\% against 65\% for SFT-CoT ($p=0.45$). Its relative weight change is only about $10^{-4}$, its DPO loss stays at $\ln 2$, and 68 of 100 outputs are identical to those of its initialization. Two further findings matter for the next stage. A strict answer parser credits the base model with 14\% where a content-based blind grader gives 74\%. The arithmetic step checker used to build reasoning-correction pairs mislabeled 24 of 25 valid solutions as invalid. We report the pilots as validation of the pipeline and its measurement, and we specify the configuration, sample size and ablations needed to test the framework.
+Small Language Models (SLMs) are attractive for on-device deployment, yet they fail on multi-step reasoning because errors compound along the chain of thought. External verifiers roughly double resident memory and add latency, and prompted self-correction is unreliable and verbose. We specify USC-DPO (Unified Step-Filtered Contrastive Direct Preference Optimization), a framework that places the \textit{Solve}, \textit{Verify} and \textit{Correct} phases in a single set of weights. Its components are discrete status tokens emitted after each step, Hard Context Truncation of rejected steps in the KV cache, and the Local Contrastive Preference (LCP) procedure, which turns the model's own solutions into step-aligned pairs for content and balanced pairs for verification. We revise our earlier objective, which attached the error tag to the rejected sample and therefore taught the model \emph{not} to flag its errors, and we give a finite-budget analysis that links verifier recall and false-alarm rate to end-to-end accuracy. USC-DPO is implemented in stages, and this report evaluates Stage~1 (\soldpo{}) on Qwen2.5-Math-1.5B. Stage~1 contains the data-recycling and preference-training pipeline only: solution-level pairs trained with standard DPO, without status tokens or truncation, so it is not yet a test of self-verification. In the larger pilot (146 pairs, 100 GSM8K test problems), \soldpo{} scores 68\% against 65\% for SFT-CoT ($p=0.45$). Its relative weight change is only about $10^{-4}$, its DPO loss stays at $\ln 2$, and 68 of 100 outputs are identical to those of its initialization. Two further findings matter for the next stage. A strict answer parser credits the base model with 14\% where a content-based blind grader gives 74\%. The arithmetic step checker used to build reasoning-correction pairs mislabeled 24 of 25 valid solutions as invalid. We report the pilots as validation of the pipeline and its measurement, and we specify the configuration, sample size and ablations for Stages~2 and~3.
 \end{abstract}
 
 \noindent\textbf{Keywords:} Small Language Models, Chain-of-Thought, Self-Verification, Self-Correction, Direct Preference Optimization (DPO), Step-level preference learning.
@@ -79,7 +78,7 @@ Two remedies dominate. The first adds an external verifier, an outcome reward mo
 
 A third route trains the verification skill into the generator. Recent evidence supports this direction: Chen et al.~\cite{chen2026selfverify} found that training a model only to judge its own solutions improved generation to a level comparable with generation training, whereas generation training did not improve self-judgment. USC-DPO pursues this route at step granularity. After each step the model emits a status token (\valid{} or \invalid{}). On \invalid{}, the step is removed from the KV cache and resampled. Training data come from the model's own correct and incorrect solutions.
 
-\paragraph{Scope of this report.} The full framework has not yet been implemented. The two pilot runs reported here train plain DPO on solution-level pairs and use no status tokens, no truncation and no step-level pairs. We label the resulting model \soldpo{} and do not present its results as evidence about USC-DPO.
+\paragraph{Scope of this report.} USC-DPO is implemented in three stages. Stage~1 (\soldpo{}) builds preference pairs from the model's own solutions and trains with standard DPO at the level of whole solutions. Stage~2 adds step-level LCP pairs and the verification term of Eq.~\eqref{eq:usc}. Stage~3 adds status tokens and Hard Context Truncation at inference. This report evaluates Stage~1 only. Because Stage~1 uses no status tokens, no truncation and no step-level pairs, it is equivalent to standard DPO, and its results do not test the self-verification mechanism.
 
 \paragraph{Contributions.}
 \begin{enumerate}
@@ -323,20 +322,20 @@ Generator and verifier are the same model, so a step the model gets wrong is als
 \paragraph{Memory and token cost.} An external verifier of the same size doubles resident weights (for 1.5B parameters in 16-bit precision, about 3~GB to 6~GB before KV caches). The unified model keeps one copy. Status tokens cost one token per step plus the tokens of discarded attempts, instead of a free-text critique.
 
 %==============================================================
-\section{Pilot Studies: Solution-Level DPO}
+\section{Pilot Studies: USC-DPO Stage~1}
 \label{sec:pilot}
 %==============================================================
 \subsection{What the pilots test}
-Two pilot runs exercise the data-recycling, training and evaluation pipeline on a single Tesla T4 GPU. Neither tests USC-DPO (Table~\ref{tab:status}). In both runs the preference-trained model is plain DPO on solution-level pairs, which we call \soldpo{}. \textbf{Run~A} (October) is the configuration criticized in the first review of this report. \textbf{Run~B} (November) retrains SFT-CoT on the full training set with a larger learning rate, rebuilds the preference data with an arithmetic step checker, and doubles the test set. Run~B is the main pilot below, and Run~A serves as a reference point.
+Two pilot runs exercise the data-recycling, training and evaluation pipeline on a single Tesla T4 GPU. Both runs evaluate Stage~1 of USC-DPO (\soldpo{}), not the full framework (Table~\ref{tab:status}). In Stage~1 the preference-trained model is standard DPO on solution-level pairs. \textbf{Run~A} (October) is the configuration criticized in the first review of this report. \textbf{Run~B} (November) retrains SFT-CoT on the full training set with a larger learning rate, rebuilds the preference data with an arithmetic step checker, and doubles the test set. Run~B is the main pilot below, and Run~A serves as a reference point.
 
 \begin{table}[t]
 \centering
-\caption{Proposed framework versus the two pilot runs.}
+\caption{Full framework versus the Stage~1 configuration evaluated in the two pilot runs.}
 \label{tab:status}
 \small
 \begin{tabularx}{\textwidth}{lXX}
 \toprule
-\textbf{Component} & \textbf{USC-DPO (proposed)} & \textbf{Pilots (\soldpo{})} \\
+\textbf{Component} & \textbf{Full USC-DPO (Stages 1--3)} & \textbf{Pilots (Stage~1, \soldpo{})} \\
 \midrule
 Status tokens, truncation & yes & no \\
 Pair granularity & step pairs + verification pairs & whole solutions \\
@@ -484,7 +483,7 @@ Discordance $\pi_d$ & $d=2$ points & $d=3$ points & $d=5$ points \\
 \section{Discussion}
 \label{sec:discussion}
 %==============================================================
-\paragraph{What the pilots show.} Run~B confirms the review's diagnosis. Raising the SFT learning rate made SFT-CoT change behavior substantially, mainly in format and length. Keeping the DPO learning rate at $10^{-6}$ left DPO with a loss at $\ln 2$, a negative mean margin and outputs mostly identical to its initialization. The observed 3-point difference between \soldpo{} and SFT-CoT is therefore not evidence of a preference-training effect. Three further findings shape the next stage. First, a strict answer parser can turn a format difference into an apparent 51-point accuracy gain. Second, the arithmetic step checker mislabels most of the solutions it flags. Third, off-policy chosen samples are a known weakness for DPO. None of the pilots provides evidence for or against USC-DPO.
+\paragraph{What the pilots show.} Run~B confirms the review's diagnosis. Raising the SFT learning rate made SFT-CoT change behavior substantially, mainly in format and length. Keeping the DPO learning rate at $10^{-6}$ left DPO with a loss at $\ln 2$, a negative mean margin and outputs mostly identical to its initialization. The observed 3-point difference between \soldpo{} and SFT-CoT is therefore not evidence of a preference-training effect. Three further findings shape the next stage. First, a strict answer parser can turn a format difference into an apparent 51-point accuracy gain. Second, the arithmetic step checker mislabels most of the solutions it flags. Third, off-policy chosen samples are a known weakness for DPO. Since Stage~1 contains no verification mechanism, the pilots provide no evidence for or against self-verification training itself.
 
 \paragraph{Relation to verification-only training.} Chen et al.~\cite{chen2026selfverify} obtained gains from a verification objective trained on the model's own solutions with balanced labels. The pilots have neither a verification objective nor on-policy chosen samples, which motivates both the verification term in Eq.~\eqref{eq:usc} and the use of the model's own correct steps in LCP. Whether their result transfers from RLVR to offline preference learning is open.
 
@@ -493,7 +492,7 @@ Discordance $\pi_d$ & $d=2$ points & $d=3$ points & $d=5$ points \\
 \paragraph{Limitations.} LCP uses a heuristic normalization for step matching, and Proposition~\ref{prop:eff} assumes independent retries (Remark~\ref{rem:assump}). Verification training also adds training-time cost.
 
 %==============================================================
-\section{Evaluation Plan for USC-DPO}
+\section{Evaluation Plan for USC-DPO Stages 2 and 3}
 \label{sec:plan}
 %==============================================================
 \paragraph{Configuration.} Table~\ref{tab:plancfg} lists the planned settings. Compared with Run~B, the main changes are a DPO learning rate one to two orders of magnitude higher, LoRA on all linear layers, on-policy chosen samples, a corrected step checker, larger data, merged adapters for timing, and a stopping rule based on held-out preference accuracy.
@@ -518,7 +517,7 @@ Grading & report strict and content-based accuracy; v2 rule frozen before evalua
 \end{tabularx}
 \end{table}
 
-\paragraph{Ablations.} (A) SFT-CoT; (B) \soldpo{}; (C) step pairs only, a Step-DPO-style baseline~\cite{lai2024stepdpo}; (D) step and verification pairs, Eq.~\eqref{eq:usc}, decoded without truncation; (E) as D with Algorithm~\ref{alg:decode}, $K\in\{1,2,3\}$; (F) as D with the old objective Eq.~\eqref{eq:old}, to confirm the tag-placement effect.
+\paragraph{Ablations.} (A) SFT-CoT; (B) Stage~1 (\soldpo{}) with the corrected configuration; (C) step pairs only, a Step-DPO-style baseline~\cite{lai2024stepdpo}; (D) step and verification pairs, Eq.~\eqref{eq:usc}, decoded without truncation; (E) as D with Algorithm~\ref{alg:decode}, $K\in\{1,2,3\}$; (F) as D with the old objective Eq.~\eqref{eq:old}, to confirm the tag-placement effect.
 
 \paragraph{Metrics.} \textbf{Pass@1}: accuracy of one greedy pass. \textbf{Verification accuracy}: accuracy of the status token on a balanced held-out set of the model's own steps. \textbf{FPR-V}: fraction of incorrect steps tagged \valid{} ($1-r$). \textbf{False alarm}: fraction of correct steps tagged \invalid{} ($f$). \textbf{CSR}: among instances with at least one \invalid{}, the fraction ending correct. \textbf{ATpP}: average generated tokens per problem, including discarded attempts.
 
@@ -528,7 +527,7 @@ Grading & report strict and content-based accuracy; v2 rule frozen before evalua
 \section{Conclusion}
 \label{sec:conclusion}
 %==============================================================
-We specified USC-DPO, a framework for step-level self-verification in a single small model, and corrected its objective so that the model is trained to flag, rather than suppress, its own errors. A finite-budget analysis shows that a retry budget of two or three recovers most of the attainable gain, and that recall on the model's own steps is the quantity that matters. Two pilots trained plain solution-level DPO. In both, the DPO learning rate left the policy essentially unchanged, and in the larger pilot most reasoning-correction pairs penalized valid solutions. The 3-point difference over SFT-CoT is therefore uninformative about the framework. The pilots did yield a working pipeline, a content-based grader that exposes format effects, an audit of the step checker, and a sample-size requirement, and Section~\ref{sec:plan} specifies the experiments that will test the framework itself.
+We specified USC-DPO, a framework for step-level self-verification in a single small model, and corrected its objective so that the model is trained to flag, rather than suppress, its own errors. A finite-budget analysis shows that a retry budget of two or three recovers most of the attainable gain, and that recall on the model's own steps is the quantity that matters. Two pilots evaluated Stage~1 of USC-DPO, which reduces to standard DPO on solution-level pairs. In both, the DPO learning rate left the policy essentially unchanged, and in the larger pilot most reasoning-correction pairs penalized valid solutions. The 3-point difference over SFT-CoT is therefore uninformative about the later stages of the framework. The pilots did yield a working pipeline, a content-based grader that exposes format effects, an audit of the step checker, and a sample-size requirement, and Section~\ref{sec:plan} specifies the experiments that will test Stages~2 and~3.
 
 \paragraph{Reproducibility.} We release the notebooks, the preference pairs of both runs, per-step training logs, all adapters, and the stored generations (150 in Run~A, 300 in Run~B) with their gradings.
 
