@@ -1,0 +1,32 @@
+[
+  {
+    "model": "Base",
+    "correct": 30,
+    "total": 50,
+    "unparsed_predictions": 0,
+    "accuracy_percent": 60.0,
+    "avg_latency_seconds": 7.719048,
+    "avg_generated_tokens": 209.88,
+    "elapsed_seconds": 386.35
+  },
+  {
+    "model": "SFT-CoT",
+    "correct": 32,
+    "total": 50,
+    "unparsed_predictions": 0,
+    "accuracy_percent": 64.0,
+    "avg_latency_seconds": 10.143008,
+    "avg_generated_tokens": 212.42,
+    "elapsed_seconds": 507.56
+  },
+  {
+    "model": "USC-DPO",
+    "correct": 30,
+    "total": 50,
+    "unparsed_predictions": 0,
+    "accuracy_percent": 60.0,
+    "avg_latency_seconds": 10.092666000000001,
+    "avg_generated_tokens": 212.6,
+    "elapsed_seconds": 505.05
+  }
+]

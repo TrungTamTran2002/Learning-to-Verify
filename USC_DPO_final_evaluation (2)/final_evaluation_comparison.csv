@@ -1,0 +1,4 @@
+model,correct,total,unparsed_predictions,accuracy_percent,avg_latency_seconds,avg_generated_tokens,elapsed_seconds
+Base,30,50,0,60.0,7.719048,209.88,386.35
+SFT-CoT,32,50,0,64.0,10.143008,212.42,507.56
+USC-DPO,30,50,0,60.0,10.092666000000001,212.6,505.05
