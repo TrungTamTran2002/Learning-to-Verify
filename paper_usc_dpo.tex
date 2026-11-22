@@ -65,7 +65,7 @@
 \maketitle
 
 \begin{abstract}
-Small Language Models (SLMs) are attractive for on-device deployment, yet they fail on multi-step reasoning because errors compound along the chain of thought. External verifiers roughly double resident memory and add latency, and prompted self-correction is unreliable and verbose. We specify USC-DPO (Unified Step-Filtered Contrastive Direct Preference Optimization), a framework that places the \textit{Solve}, \textit{Verify} and \textit{Correct} phases in a single set of weights. Its components are discrete status tokens emitted after each step, Hard Context Truncation of rejected steps in the KV cache, and the Local Contrastive Preference (LCP) procedure, which turns self-generated solutions into step-aligned pairs for content and balanced pairs for verification. We revise our earlier objective, which attached the error tag to the rejected sample and therefore taught the model \emph{not} to flag its errors, and we give a finite-budget analysis that links verifier recall and false-alarm rate to end-to-end accuracy. This report does \emph{not} yet evaluate USC-DPO. Its experiment is a pilot of plain solution-level DPO (\soldpo{}) on Qwen2.5-Math-1.5B with 81 pairs. Weight diagnostics show the pilot barely moved the model: the relative weight change was about $10^{-4}$, and on 33 of 50 GSM8K test problems the greedy output is character-identical to the base model. Accuracy is indistinguishable across Base, SFT-CoT and \soldpo{} (37/50 each under a blind rule-based grader). With 50 problems, only differences of about 12 points are detectable. We therefore report the pilot as a validation of the pipeline and the grading procedure, and we specify the configuration, sample size and ablations needed to test the framework.
+Small Language Models (SLMs) are attractive for on-device deployment, yet they fail on multi-step reasoning because errors compound along the chain of thought. External verifiers roughly double resident memory and add latency, and prompted self-correction is unreliable and verbose. We specify USC-DPO (Unified Step-Filtered Contrastive Direct Preference Optimization), a framework that places the \textit{Solve}, \textit{Verify} and \textit{Correct} phases in a single set of weights. Its components are discrete status tokens emitted after each step, Hard Context Truncation of rejected steps in the KV cache, and the Local Contrastive Preference (LCP) procedure, which turns the model's own solutions into step-aligned pairs for content and balanced pairs for verification. We revise our earlier objective, which attached the error tag to the rejected sample and therefore taught the model \emph{not} to flag its errors, and we give a finite-budget analysis that links verifier recall and false-alarm rate to end-to-end accuracy. This report does \emph{not} yet evaluate USC-DPO. Its two pilots train plain solution-level DPO (\soldpo{}) on Qwen2.5-Math-1.5B. In the larger pilot (146 pairs, 100 GSM8K test problems), \soldpo{} scores 68\% against 65\% for SFT-CoT ($p=0.45$). Its relative weight change is only about $10^{-4}$, its DPO loss stays at $\ln 2$, and 68 of 100 outputs are identical to those of its initialization. Two further findings matter for the next stage. A strict answer parser credits the base model with 14\% where a content-based blind grader gives 74\%. The arithmetic step checker used to build reasoning-correction pairs mislabeled 24 of 25 valid solutions as invalid. We report the pilots as validation of the pipeline and its measurement, and we specify the configuration, sample size and ablations needed to test the framework.
 \end{abstract}
 
 \noindent\textbf{Keywords:} Small Language Models, Chain-of-Thought, Self-Verification, Self-Correction, Direct Preference Optimization (DPO), Step-level preference learning.
@@ -79,14 +79,14 @@ Two remedies dominate. The first adds an external verifier, an outcome reward mo
 
 A third route trains the verification skill into the generator. Recent evidence supports this direction: Chen et al.~\cite{chen2026selfverify} found that training a model only to judge its own solutions improved generation to a level comparable with generation training, whereas generation training did not improve self-judgment. USC-DPO pursues this route at step granularity. After each step the model emits a status token (\valid{} or \invalid{}). On \invalid{}, the step is removed from the KV cache and resampled. Training data come from the model's own correct and incorrect solutions.
 
-\paragraph{Scope of this report.} The full framework has not yet been implemented. The experiment reported here trains plain DPO on 81 solution-level pairs and does not use status tokens, truncation or step-level pairs. We label this model \soldpo{} and do not present its results as evidence about USC-DPO.
+\paragraph{Scope of this report.} The full framework has not yet been implemented. The two pilot runs reported here train plain DPO on solution-level pairs and use no status tokens, no truncation and no step-level pairs. We label the resulting model \soldpo{} and do not present its results as evidence about USC-DPO.
 
 \paragraph{Contributions.}
 \begin{enumerate}
     \item A specification of USC-DPO: the status-token protocol, decoding with truncation and a retry budget, and LCP with normalized step matching (Section~\ref{sec:method}).
     \item A corrected training objective. Our earlier formulation appended \invalid{} to the rejected sample, so DPO \emph{lowered} the probability of flagging errors. The revised objective separates a step-content term from a balanced verification term (Section~\ref{sec:loss}).
     \item An analysis of verified decoding under a finite retry budget $K$, with its assumptions stated explicitly (Proposition~\ref{prop:eff}).
-    \item A pilot study with weight-level diagnostics, a blind rule-based re-grading checked against manual labels, and a power analysis. Together they explain why the pilot could not detect an effect (Sections~\ref{sec:pilot}--\ref{sec:discussion}).
+    \item Two pilot runs with weight-level diagnostics, a blind content-based re-grading, an audit of the preference data, and a power analysis. Together they explain why the pilots could not detect an effect of preference training (Sections~\ref{sec:pilot}--\ref{sec:discussion}).
     \item A concrete evaluation plan for the full framework: corrected hyperparameters, sample size, ablations and success criteria (Section~\ref{sec:plan}).
 \end{enumerate}
 
@@ -323,128 +323,147 @@ Generator and verifier are the same model, so a step the model gets wrong is als
 \paragraph{Memory and token cost.} An external verifier of the same size doubles resident weights (for 1.5B parameters in 16-bit precision, about 3~GB to 6~GB before KV caches). The unified model keeps one copy. Status tokens cost one token per step plus the tokens of discarded attempts, instead of a free-text critique.
 
 %==============================================================
-\section{Pilot Study: Solution-Level DPO}
+\section{Pilot Studies: Solution-Level DPO}
 \label{sec:pilot}
 %==============================================================
-\subsection{What the pilot tests}
-The pilot checks the data-recycling, training and evaluation pipeline on a T4 GPU. It does not test USC-DPO (Table~\ref{tab:status}). The trained model is plain DPO on solution-level pairs, which we call \soldpo{}.
+\subsection{What the pilots test}
+Two pilot runs exercise the data-recycling, training and evaluation pipeline on a single Tesla T4 GPU. Neither tests USC-DPO (Table~\ref{tab:status}). In both runs the preference-trained model is plain DPO on solution-level pairs, which we call \soldpo{}. \textbf{Run~A} (October) is the configuration criticized in the first review of this report. \textbf{Run~B} (November) retrains SFT-CoT on the full training set with a larger learning rate, rebuilds the preference data with an arithmetic step checker, and doubles the test set. Run~B is the main pilot below, and Run~A serves as a reference point.
 
 \begin{table}[t]
 \centering
-\caption{Proposed framework versus the pilot configuration.}
+\caption{Proposed framework versus the two pilot runs.}
 \label{tab:status}
 \small
 \begin{tabularx}{\textwidth}{lXX}
 \toprule
-\textbf{Component} & \textbf{USC-DPO (proposed)} & \textbf{Pilot (\soldpo{})} \\
+\textbf{Component} & \textbf{USC-DPO (proposed)} & \textbf{Pilots (\soldpo{})} \\
 \midrule
-Backbone & Qwen2.5-Math-1.5B, later 7B & Qwen2.5-Math-1.5B~\cite{yang2024qwen25math} \\
 Status tokens, truncation & yes & no \\
 Pair granularity & step pairs + verification pairs & whole solutions \\
+Chosen sample & model's own correct step & GSM8K reference solution (except Run~A step-efficiency pairs) \\
 Objective & Eq.~\eqref{eq:usc} & standard DPO, Eq.~\eqref{eq:dpo} \\
-Scale & thousands of problems & 81 pairs from 48 problems \\
-Evaluation & full GSM8K test, MATH-500, $\ge 3$ seeds & 50 GSM8K problems, 1 seed \\
+Scale & thousands of problems & Run~A: 81 pairs / 48 problems; Run~B: 146 pairs / 68 problems \\
+Evaluation & full GSM8K test, MATH-500, $\ge 3$ seeds & Run~A: 50 problems; Run~B: 100 problems; 1 seed \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \subsection{Data and training}
-We sampled four solutions for each of the first 80 GSM8K training problems from Qwen2.5-Math-1.5B (temperature 0.85, top-$p$ 0.95, at most 384 new tokens), giving 320 candidates. A rule-based parser labeled 241 as correct and 61 as incorrect; 18 had no readable answer and were left unlabeled. The 81 pairs comprise 61 \emph{answer-correction} pairs (correct $\succ$ incorrect solution) and 20 \emph{step-efficiency} pairs (both correct, shorter $\succ$ longer, with redundancy detected by text rules). They come from 48 distinct problems.
+Both runs use Qwen2.5-Math-1.5B~\cite{yang2024qwen25math} with LoRA~\cite{hu2022lora} ($r=8$, $\alpha=16$, dropout 0.05, q and v projections; 1{,}089{,}536 trainable parameters, about 0.07\%). Table~\ref{tab:hparams} lists the differences.
 
-Three models are compared. \textbf{Base} is Qwen2.5-Math-1.5B. \textbf{SFT-CoT} adds a LoRA adapter~\cite{hu2022lora} trained on 100 GSM8K solutions. \textbf{\soldpo{}} merges the SFT adapter into the base and trains a new LoRA adapter with DPO. Table~\ref{tab:hparams} lists the settings.
+\textbf{Run~B data.} The first 80 GSM8K training problems are held out as a preference pool, and the remaining 7{,}393 solutions train SFT-CoT. The SFT-CoT model samples four solutions per pool problem (temperature 0.85, top-$p$ 0.95, at most 384 new tokens), giving 320 candidates: 186 with a correct final answer, 126 incorrect and 8 unreadable. A rule-based step checker evaluates explicit arithmetic equalities in each of the 1{,}392 deduplicated steps and labels a step \texttt{UNKNOWN} when it finds no checkable equality (611 steps). Two pair types are built. \emph{Answer-correction} pairs (121) prefer the GSM8K reference solution to a sampled solution with a wrong answer. \emph{Reasoning-correction} pairs (25) prefer the reference solution to a sampled solution that has the correct answer but contains an equality the checker marked false. The 146 pairs come from 68 problems, and no step-efficiency pair passed the filter.
 
 \begin{table}[t]
 \centering
-\caption{Pilot training configuration.}
+\caption{Pilot training configurations.}
 \label{tab:hparams}
 \small
 \begin{tabular}{lll}
 \toprule
-\textbf{Setting} & \textbf{SFT-CoT} & \textbf{\soldpo{}} \\
+\textbf{Setting} & \textbf{Run~A} & \textbf{Run~B} \\
 \midrule
-LoRA rank / $\alpha$ / dropout & 8 / 16 / 0.05 & 8 / 16 / 0.05 \\
-Target modules & q\_proj, v\_proj & q\_proj, v\_proj \\
-Data & 100 solutions & 81 pairs \\
-Batch / optimizer steps & 1 $\times$ 4 accumulation / 25 & 1 / 243 (3 epochs) \\
-Learning rate & $2\times10^{-6}$ & $1\times10^{-6}$ \\
-$\beta$ & -- & 0.1 \\
-Trainable parameters & 1{,}089{,}536 ($\approx$0.07\%) & 1{,}089{,}536 ($\approx$0.07\%) \\
+SFT-CoT data / steps & 100 solutions / 25 & 7{,}393 solutions / 1{,}849 \\
+SFT-CoT learning rate & $2\times10^{-6}$ & $1\times10^{-5}$ \\
+Candidates sampled from & Base & SFT-CoT \\
+Preference pairs & 61 answer-corr.\ + 20 step-eff. & 121 answer-corr.\ + 25 reasoning-corr. \\
+DPO epochs / steps & 3 / 243 & 3 / 438 \\
+DPO learning rate / $\beta$ & $1\times10^{-6}$ / 0.1 & $1\times10^{-6}$ / 0.1 \\
+Test problems & first 50 & first 100 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Evaluation protocol}
-All models answer the first 50 GSM8K test problems with greedy decoding, the same prompt, and at most 384 new tokens. We grade with three procedures. \emph{Original:} the extractor used during the run, which falls back to an incidental number when no \texttt{\#\#\#\#} marker or boxed answer is present. \emph{Blind rule (v2):} a deterministic extractor applied to the 150 outputs in shuffled order without model identity. It takes, in order, a \texttt{\#\#\#\#} marker, a boxed answer, ``the answer is'', and otherwise the value after the last ``='' in the final sentence, or else the first number in that sentence. \emph{Manual:} the authors' reading of each output. The v2 rule was designed after inspecting failures on these same outputs, so its agreement with the manual labels is a consistency check, not an independent validation. Intervals are Wilson 95\%~\cite{wilson1927probable}, and paired comparisons use the exact McNemar test~\cite{mcnemar1947note}.
+All models answer the same problems with the same prompt, greedy decoding, repetition penalty 1.05 and at most 384 new tokens. We grade with two procedures. \emph{Strict}: the Run~B parser accepts only a \texttt{\#\#\#\#} marker, a boxed answer or a marked final line, and counts anything else as incorrect. \emph{Blind rule (v2)}: a deterministic extractor applied to all outputs in shuffled order without model identity. It takes, in order, a \texttt{\#\#\#\#} marker, a boxed answer, ``the answer is'', and otherwise the value after the last ``='' in the final sentence, or else the first number in that sentence. The v2 rule was written after inspecting Run~A failures. On Run~A it agreed with the authors' manual labels on 149 of 150 outputs (Cohen's $\kappa=0.98$), and it was then applied unchanged to Run~B. Intervals are Wilson 95\%~\cite{wilson1927probable}, and paired comparisons use the exact McNemar test~\cite{mcnemar1947note}.
 
 %==============================================================
 \section{Pilot Results}
 \label{sec:results}
 %==============================================================
-\subsection{Training dynamics}
-Across the 243 steps, the DPO loss ranged from 0.634 to 0.751, and the epoch means stayed at $\ln 2$ (Table~\ref{tab:train}). The margin was positive in 129 of 243 steps (53.1\%). The implementation is consistent with Eq.~\eqref{eq:dpo}: step 1 has margin 0 and loss 0.6931, and step 3 has margin 0.1226 and loss 0.6337.
+\subsection{Accuracy and the effect of answer format}
+Table~\ref{tab:acc} shows that the grader changes the conclusion. Under strict parsing, Base scores 14\% and SFT-CoT 65\%, an apparent gain of 51 points. However, 80 of the 100 Base outputs have no final-answer marker and are therefore counted as wrong. Under the blind v2 rule, Base scores 74\%, SFT-CoT 66\% and \soldpo{} 68\%. A spot check of 10 of the 60 Base outputs credited only by v2 found that each final sentence states the reference answer. The strict comparison therefore mostly measures format compliance: SFT-CoT learned to emit the marker.
 
 \begin{table}[t]
 \centering
-\caption{\soldpo{} training: mean loss, mean margin and fraction of steps with positive margin (81 steps per epoch).}
+\caption{Accuracy (\%) with Wilson 95\% intervals. Run~A: 50 problems; Run~B: 100 problems.}
+\label{tab:acc}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Run~B strict} & \textbf{Run~B blind rule (v2)} & \textbf{Run~A blind rule (v2)} \\
+\midrule
+Base & 14 (9--22); 80 unparsed & 74 (65--82) & 74 (60--84) \\
+SFT-CoT & 65 (55--74); 3 unparsed & 66 (56--75) & 74 (60--84) \\
+\soldpo{} & 68 (58--76); 2 unparsed & 68 (58--76) & 74 (60--84) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+None of the paired differences is significant (Table~\ref{tab:paired}). \soldpo{} and SFT-CoT disagree on only 6 or 7 problems, and the direction favoring \soldpo{} rests on 5 versus 2 (strict) or 4 versus 2 (v2) problems. Under v2, Base is ahead of SFT-CoT on 14 problems and behind on 6 ($p=0.12$), so the content-graded evidence does not support the claim that SFT-CoT improved reasoning over Base.
+
+\begin{table}[t]
+\centering
+\caption{Run~B paired comparisons: problems solved by A only and by B only, with exact McNemar $p$.}
+\label{tab:paired}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{A vs.\ B} & \textbf{Strict} & \textbf{Blind rule (v2)} \\
+\midrule
+\soldpo{} vs.\ SFT-CoT & 5 / 2, $p=0.45$ & 4 / 2, $p=0.69$ \\
+SFT-CoT vs.\ Base & -- & 6 / 14, $p=0.12$ \\
+\soldpo{} vs.\ Base & -- & 8 / 14, $p=0.29$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Training dynamics}
+In Run~B the DPO loss ranged from 0.642 to 0.756 over 438 steps, and the epoch means were 0.6967, 0.6962 and 0.6938, all at $\ln 2$ (Table~\ref{tab:train}). The mean margin was negative in every epoch, and it was positive in only 200 of 438 steps (45.7\%). The policy did not learn to prefer the chosen samples. Run~A showed the same pattern (epoch means 0.6925, 0.6924, 0.6935; margin positive in 53.1\% of steps).
+
+\begin{table}[t]
+\centering
+\caption{Run~B DPO training: mean loss, mean margin and fraction of steps with positive margin (146 steps per epoch).}
 \label{tab:train}
 \small
 \begin{tabular}{cccc}
 \toprule
 \textbf{Epoch} & \textbf{Mean loss} & \textbf{Mean margin} & \textbf{Positive-margin steps} \\
 \midrule
-1 & 0.6925 & $+0.0016$ & 50.6\% \\
-2 & 0.6924 & $+0.0021$ & 59.3\% \\
-3 & 0.6935 & $-0.0001$ & 49.4\% \\
+1 & 0.6967 & $-0.0067$ & 42.5\% \\
+2 & 0.6962 & $-0.0058$ & 46.6\% \\
+3 & 0.6938 & $-0.0009$ & 47.9\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Did the adapters change the model?}
-We measured the update directly. For each adapted matrix, the LoRA update is $\Delta W=\tfrac{\alpha}{r}BA$. We compared $\|\Delta W\|_F$ with $\|W\|_F$ of the corresponding base matrix for the q and v projections of layers 0, 9, 18 and 27 (Table~\ref{tab:diag}). The relative change is of order $10^{-5}$ for SFT-CoT and $10^{-4}$ for \soldpo{}. When the SFT adapter is merged into a 16-bit backbone, as was done before DPO training, only 0.7\% (bfloat16) to 5.2\% (float16) of the entries in these matrices change value at all. At the output level, greedy generations are character-identical to the base model on 33 of 50 problems for both SFT-CoT and \soldpo{}.
+For each adapted matrix the LoRA update is $\Delta W=\tfrac{\alpha}{r}BA$. Table~\ref{tab:diag} compares $\|\Delta W\|_F$ with $\|W\|_F$ for the q and v projections of layers 0, 9, 18 and 27. Raising the SFT learning rate to $10^{-5}$ and using the full training set increased the relative SFT update about 370-fold, from $2.4\times10^{-5}$ to $8.8\times10^{-3}$. This change is visible in behavior: no Run~B SFT-CoT output is identical to Base, the mean length fell from 204 to 112 tokens, and unparsed outputs fell from 80 to 3. The DPO learning rate stayed at $10^{-6}$, and the DPO update stayed at about $10^{-4}$ in both runs. In Run~B, 68 of 100 \soldpo{} outputs are character-identical to those of its SFT-CoT initialization. With Adam, a learning rate of $10^{-6}$ bounds the change of each parameter to about $10^{-6}$ per step, so 438 steps cannot move $B$, which starts at zero, beyond about $4\times10^{-4}$. The observed maximum is $2.8\times10^{-4}$. LoRA fine-tuning typically uses learning rates on the order of $10^{-4}$~\cite{dettmers2023qlora}.
 
 \begin{table}[t]
 \centering
-\caption{Size of the learned updates and output agreement. Relative change is $\|\Delta W\|_F/\|W\|_F$ over eight sampled q/v matrices.}
+\caption{Size of the learned updates and output agreement. Relative change is $\|\Delta W\|_F/\|W\|_F$ over eight sampled q/v matrices (mean).}
 \label{tab:diag}
 \small
-\begin{tabular}{lcc}
+\begin{tabular}{lcccc}
 \toprule
- & \textbf{SFT-CoT} & \textbf{\soldpo{}} \\
+ & \multicolumn{2}{c}{\textbf{Run~A}} & \multicolumn{2}{c}{\textbf{Run~B}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+ & SFT-CoT & \soldpo{} & SFT-CoT & \soldpo{} \\
 \midrule
-Mean $\|\Delta W\|_F$ (56 matrices) & $1.0\times10^{-3}$ & $4.8\times10^{-3}$ \\
-Relative change, mean (max) & $2.4\times10^{-5}$ ($3.5\times10^{-5}$) & $1.0\times10^{-4}$ ($1.9\times10^{-4}$) \\
-Outputs identical to Base & 33/50 & 33/50 \\
-Same extracted answer as Base & 44/50 & 42/50 \\
+Relative change & $2.4\times10^{-5}$ & $1.0\times10^{-4}$ & $8.8\times10^{-3}$ & $1.3\times10^{-4}$ \\
+Outputs identical to the model it starts from & 33/50 & 26/50 & 0/100 & 68/100 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-These figures follow from the configuration. With a learning rate of $10^{-6}$, Adam changes each parameter by at most about $10^{-6}$ per step, so 25 to 243 steps cannot move $B$, which starts at zero, far from zero. The observed maxima, $\max|B|=2.5\times10^{-5}$ for SFT-CoT and $2.1\times10^{-4}$ for \soldpo{}, are close to these bounds ($5\times10^{-5}$ and $2.4\times10^{-4}$), so the size of the update was limited by the learning rate. LoRA fine-tuning typically uses learning rates on the order of $10^{-4}$; QLoRA, for example, used $1$--$2\times10^{-4}$~\cite{dettmers2023qlora}. A null result was therefore expected before evaluation, and the SFT-CoT baseline is in practice also very close to Base.
-
-\subsection{Accuracy}
-Table~\ref{tab:acc} reports the three gradings. The v2 rule and the manual labels agree on 149 of 150 outputs (Cohen's $\kappa=0.98$); the one disagreement is an SFT-CoT output whose final sentence contains both the answer and another number. Under every grading the three models are within one problem of each other. On v2 labels, the discordant problems split 1 vs.\ 1 (SFT-CoT vs.\ Base), 3 vs.\ 3 (\soldpo{} vs.\ SFT-CoT) and 2 vs.\ 2 (\soldpo{} vs.\ Base); every exact McNemar $p$-value is 1.0.
-
-\begin{table}[t]
-\centering
-\caption{Accuracy on 50 GSM8K test problems, with Wilson 95\% intervals.}
-\label{tab:acc}
-\small
-\begin{tabular}{lccc}
-\toprule
-\textbf{Model} & \textbf{Original grader} & \textbf{Blind rule (v2)} & \textbf{Manual (non-blind)} \\
-\midrule
-Base & 30/50, 60\% (46--72) & 37/50, 74\% (60--84) & 37/50, 74\% (60--84) \\
-SFT-CoT & 32/50, 64\% (50--76) & 37/50, 74\% (60--84) & 38/50, 76\% (63--86) \\
-\soldpo{} & 30/50, 60\% (46--72) & 37/50, 74\% (60--84) & 37/50, 74\% (60--84) \\
-\bottomrule
-\end{tabular}
-\end{table}
+\subsection{Quality of the preference data}
+We re-checked the 25 reasoning-correction pairs by evaluating every equality in the rejected solutions after removing currency signs and thousands separators and reading ``x'' and ``\%'' as multiplication and percent. In 24 of the 25 rejected solutions every equality is arithmetically true. The checker had parsed, for example, ``2 x 12 = 24'' as ``12 = 24'' and ``\$10 + \$20 + \$30 = 60'' as ``30 = 60''. Only one rejected solution contains a genuinely malformed equality (``40/100 = 636''), and all 25 reach the correct final answer. These pairs therefore teach the model to disprefer valid solutions. In addition, every chosen sample in Run~B, and every answer-correction chosen sample in Run~A, is a GSM8K reference solution rather than a sample from the model being trained. Step-DPO reports that self-generated chosen data is more effective than data from humans or GPT-4 for DPO, which it attributes to their out-of-distribution nature~\cite{lai2024stepdpo}. Both issues weaken the preference signal independently of the learning rate.
 
 \subsection{Efficiency}
-Mean generated length is 209.9, 212.4 and 212.6 tokens, and 4, 5 and 3 outputs reach the 384-token limit (Base, SFT-CoT, \soldpo{}). Mean latency is 7.72~s for Base and about 10.1~s for both adapter models. In the evaluation code, both adapter models run as unmerged PEFT wrappers, which add two low-rank products per adapted projection at every decoding step. LoRA adds no inference latency once merged~\cite{hu2022lora}, so the gap most likely reflects the unmerged evaluation rather than the models. We did not measure merged latency.
+In Run~B mean latency is 8.6~s for Base and 6.2--6.3~s for the adapter models, but only because their outputs are about half as long. Per generated token, the adapter models are slower (0.056~s versus 0.042~s, about 31\%). Both adapter models are evaluated as unmerged PEFT wrappers, which add two low-rank products per adapted projection at each decoding step. LoRA adds no inference latency once merged~\cite{hu2022lora}, so this overhead most likely comes from the evaluation setup and not from the models. We did not measure merged latency.
 
 \subsection{Statistical power}
-For a paired comparison, the number of problems needed to detect an accuracy difference $d$ at $\alpha=0.05$ with 80\% power is about $n\approx(z_{0.975}\sqrt{\pi_d}+z_{0.8}\sqrt{\pi_d-d^2})^2/d^2$, where $\pi_d$ is the fraction of discordant problems. In our pilot $\pi_d$ was 4--12\%. Table~\ref{tab:power} gives values. With $n=50$ and $\pi_d=0.10$, the minimum detectable difference is about 12 points. Detecting a 3-point difference needs roughly 520--870 problems, which the full GSM8K test set (1{,}319 problems) provides.
+For a paired comparison, the number of problems needed to detect an accuracy difference $d$ at $\alpha=0.05$ with 80\% power is about $n\approx(z_{0.975}\sqrt{\pi_d}+z_{0.8}\sqrt{\pi_d-d^2})^2/d^2$, where $\pi_d$ is the fraction of discordant problems. In Run~B, \soldpo{} and SFT-CoT disagree on 6--7\% of problems. With $n=100$ and $\pi_d=0.06$, the minimum detectable difference is about 7 points, more than twice the observed 2--3 points. Table~\ref{tab:power} shows that detecting a 3-point difference needs roughly 520--870 problems, which the full GSM8K test set (1{,}319) provides.
 
 \begin{table}[t]
 \centering
@@ -465,19 +484,19 @@ Discordance $\pi_d$ & $d=2$ points & $d=3$ points & $d=5$ points \\
 \section{Discussion}
 \label{sec:discussion}
 %==============================================================
-\paragraph{What the pilot shows.} The pilot validates the pipeline end to end and uncovered a grading defect that shifted absolute accuracy by up to 14 points. Its accuracy comparison is uninformative for three separate reasons, any one of which would suffice: the trained model is not USC-DPO, the optimization barely changed the weights, and the sample can only detect differences of about 12 points. The pilot provides no evidence for or against USC-DPO.
+\paragraph{What the pilots show.} Run~B confirms the review's diagnosis. Raising the SFT learning rate made SFT-CoT change behavior substantially, mainly in format and length. Keeping the DPO learning rate at $10^{-6}$ left DPO with a loss at $\ln 2$, a negative mean margin and outputs mostly identical to its initialization. The observed 3-point difference between \soldpo{} and SFT-CoT is therefore not evidence of a preference-training effect. Three further findings shape the next stage. First, a strict answer parser can turn a format difference into an apparent 51-point accuracy gain. Second, the arithmetic step checker mislabels most of the solutions it flags. Third, off-policy chosen samples are a known weakness for DPO. None of the pilots provides evidence for or against USC-DPO.
 
-\paragraph{Relation to verification-only training.} Chen et al.~\cite{chen2026selfverify} obtained gains from a verification objective with balanced data, which the pilot lacks entirely. This motivates the verification term in Eq.~\eqref{eq:usc}. Whether their result transfers from RLVR to offline preference learning is open.
+\paragraph{Relation to verification-only training.} Chen et al.~\cite{chen2026selfverify} obtained gains from a verification objective trained on the model's own solutions with balanced labels. The pilots have neither a verification objective nor on-policy chosen samples, which motivates both the verification term in Eq.~\eqref{eq:usc} and the use of the model's own correct steps in LCP. Whether their result transfers from RLVR to offline preference learning is open.
 
-\paragraph{Threats to validity.} \emph{Internal:} the v2 grader was tuned on the same outputs, and manual labels were produced by the authors with knowledge of the model. \emph{External:} one model size, one benchmark, 50 problems, one seed. \emph{Construct:} GSM8K accuracy does not measure verification; that requires CSR and FPR-V on the model's own steps.
+\paragraph{Threats to validity.} \emph{Internal:} the v2 rule was written after seeing Run~A outputs; its manual check covers Run~A fully but only a sample of Run~B; and manual labels were produced by the authors with knowledge of the models. \emph{External:} one model size, one benchmark, at most 100 problems and one seed. \emph{Construct:} GSM8K accuracy does not measure verification; that requires CSR and FPR-V on the model's own steps.
 
-\paragraph{Limitations.} LCP uses a heuristic normalization for step matching, the step-efficiency filter cannot prove that removed steps were redundant, and Proposition~\ref{prop:eff} assumes independent retries (Remark~\ref{rem:assump}). Verification training also adds training-time cost.
+\paragraph{Limitations.} LCP uses a heuristic normalization for step matching, and Proposition~\ref{prop:eff} assumes independent retries (Remark~\ref{rem:assump}). Verification training also adds training-time cost.
 
 %==============================================================
 \section{Evaluation Plan for USC-DPO}
 \label{sec:plan}
 %==============================================================
-\paragraph{Configuration.} Table~\ref{tab:plancfg} lists the planned settings. The main changes from the pilot are a learning rate two orders of magnitude higher, LoRA on all linear layers, larger batches and data, merged adapters for timing, and a stopping rule based on held-out preference accuracy rather than a fixed step count.
+\paragraph{Configuration.} Table~\ref{tab:plancfg} lists the planned settings. Compared with Run~B, the main changes are a DPO learning rate one to two orders of magnitude higher, LoRA on all linear layers, on-policy chosen samples, a corrected step checker, larger data, merged adapters for timing, and a stopping rule based on held-out preference accuracy.
 
 \begin{table}[t]
 \centering
@@ -488,29 +507,30 @@ Discordance $\pi_d$ & $d=2$ points & $d=3$ points & $d=5$ points \\
 \toprule
 \textbf{Item} & \textbf{Setting} \\
 \midrule
-Data & $\ge$ 2{,}000 GSM8K training problems $\times$ 8 samples; held-out 10\% of pairs \\
-SFT-CoT baseline & full GSM8K training set (7{,}473), LoRA, learning rate $\sim 10^{-4}$, 2--3 epochs \\
+SFT-CoT baseline & keep Run~B (7{,}393 solutions, learning rate $10^{-5}$) and add one run at $\sim10^{-4}$ \\
+Preference data & $\ge$ 2{,}000 training problems $\times$ 8 samples from the SFT-CoT model; chosen = the model's own correct solution or step; 10\% of pairs held out \\
+Step checker & tokenize currency, thousands separators, ``x'' and ``\%'' before evaluating equalities; audit 50 flagged steps by hand before use \\
 Preference training & LoRA $r=16$ on all attention and MLP projections; learning rate in $\{10^{-5},5\times10^{-5},10^{-4}\}$; $\beta\in\{0.1,0.3\}$; effective batch 16--32 \\
 Training check & held-out preference accuracy $>$ 70\% and increasing margin before any test evaluation \\
 Evaluation & full GSM8K test (1{,}319) and MATH-500; greedy and 3 sampling seeds; merged adapters for latency \\
-Grading & v2 extractor frozen before evaluation; 10\% sample double-annotated blind to model, Cohen's $\kappa$ reported \\
+Grading & report strict and content-based accuracy; v2 rule frozen before evaluation; 10\% double-annotated blind to model, Cohen's $\kappa$ reported \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \paragraph{Ablations.} (A) SFT-CoT; (B) \soldpo{}; (C) step pairs only, a Step-DPO-style baseline~\cite{lai2024stepdpo}; (D) step and verification pairs, Eq.~\eqref{eq:usc}, decoded without truncation; (E) as D with Algorithm~\ref{alg:decode}, $K\in\{1,2,3\}$; (F) as D with the old objective Eq.~\eqref{eq:old}, to confirm the tag-placement effect.
 
-\paragraph{Metrics.} \textbf{Pass@1}: accuracy of one greedy pass. \textbf{Verification accuracy}: accuracy of the status token on a balanced held-out set of the model's own steps. \textbf{FPR-V}: fraction of incorrect steps tagged \valid{} ($1-r$). \textbf{False alarm}: fraction of correct steps tagged \invalid{} ($f$). \textbf{CSR}: among instances with at least one \invalid{}, the fraction ending correct. \textbf{ATpP}: average generated tokens per problem, including discarded attempts. Step correctness for FPR-V is established by comparing intermediate values with a reference solution or by an arithmetic check.
+\paragraph{Metrics.} \textbf{Pass@1}: accuracy of one greedy pass. \textbf{Verification accuracy}: accuracy of the status token on a balanced held-out set of the model's own steps. \textbf{FPR-V}: fraction of incorrect steps tagged \valid{} ($1-r$). \textbf{False alarm}: fraction of correct steps tagged \invalid{} ($f$). \textbf{CSR}: among instances with at least one \invalid{}, the fraction ending correct. \textbf{ATpP}: average generated tokens per problem, including discarded attempts.
 
-\paragraph{Hypotheses.} H1: D improves verification accuracy over C on held-out steps. H2: E improves Pass@1 over D for $K\ge2$, with gains consistent in direction with Table~\ref{tab:analytic} given the measured $r$ and $f$. H3: F yields lower recall $r$ than D. Each hypothesis is tested with paired tests on the full GSM8K test set.
+\paragraph{Hypotheses.} H1: D improves verification accuracy over C on held-out steps. H2: E improves Pass@1 over D for $K\ge2$, consistent in direction with Table~\ref{tab:analytic} given the measured $r$ and $f$. H3: F yields lower recall $r$ than D. Each hypothesis is tested with paired tests on the full GSM8K test set.
 
 %==============================================================
 \section{Conclusion}
 \label{sec:conclusion}
 %==============================================================
-We specified USC-DPO, a framework for step-level self-verification in a single small model, and corrected its objective so that the model is trained to flag, rather than suppress, its own errors. A finite-budget analysis shows that a retry budget of two or three recovers most of the attainable gain, and that recall on the model's own steps is the quantity that matters. Our pilot trained plain solution-level DPO and, by weight-level and output-level diagnostics, left the model nearly unchanged. Its null accuracy result is therefore uninformative about the framework. The value of the pilot lies in the working pipeline, a corrected grader checked against manual labels, and a sample-size requirement. Section~\ref{sec:plan} specifies the experiments that will test the framework itself.
+We specified USC-DPO, a framework for step-level self-verification in a single small model, and corrected its objective so that the model is trained to flag, rather than suppress, its own errors. A finite-budget analysis shows that a retry budget of two or three recovers most of the attainable gain, and that recall on the model's own steps is the quantity that matters. Two pilots trained plain solution-level DPO. In both, the DPO learning rate left the policy essentially unchanged, and in the larger pilot most reasoning-correction pairs penalized valid solutions. The 3-point difference over SFT-CoT is therefore uninformative about the framework. The pilots did yield a working pipeline, a content-based grader that exposes format effects, an audit of the step checker, and a sample-size requirement, and Section~\ref{sec:plan} specifies the experiments that will test the framework itself.
 
-\paragraph{Reproducibility.} We release the notebook, the 81 pilot pairs, per-step training logs, both adapters, and the 150 stored generations with all three gradings.
+\paragraph{Reproducibility.} We release the notebooks, the preference pairs of both runs, per-step training logs, all adapters, and the stored generations (150 in Run~A, 300 in Run~B) with their gradings.
 
 \appendix
 \section{Worked Example of LCP}

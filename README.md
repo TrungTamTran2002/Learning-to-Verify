@@ -29,11 +29,13 @@ Quy trình: thử mô hình gốc → huấn luyện SFT-CoT → sinh 320 lời 
 
 ## Trạng thái kết quả
 
-Thí nghiệm hiện tại là **thí nghiệm thử (pilot)** với DPO thường trên 81 cặp ở mức cả lời giải, gọi là **Sol-DPO**. Nó **không phải** USC-DPO: chưa có token trạng thái `<|step_valid|>` / `<|step_invalid|>`, chưa cắt KV cache, chưa có cặp mức bước và cặp kiểm chứng.
+Hai lượt thí nghiệm thử (pilot) đều là DPO thường ở mức cả lời giải, gọi là **Sol-DPO**, **không phải** USC-DPO (chưa có token trạng thái, cắt KV cache, cặp mức bước và cặp kiểm chứng).
 
-Kết quả chẩn đoán:
-- Adapter gần như không thay đổi mô hình: thay đổi tương đối của trọng số khoảng 1e-4 (Sol-DPO) và 2e-5 (SFT-CoT), do learning rate 1e-6 / 2e-6 quá nhỏ cho LoRA.
-- 33/50 lời giải giống hệt mô hình gốc từng ký tự.
-- Độ chính xác ngang nhau: 37/50 ở cả ba mô hình theo bộ chấm tự động mù (v2); 50 câu chỉ phát hiện được chênh lệch khoảng 12 điểm.
+- **Run A (10/2026):** 81 cặp, 50 câu test. Ba mô hình ngang nhau (37/50).
+- **Run B (11/2026):** SFT-CoT huấn luyện trên 7.393 mẫu, lr 1e-5; 146 cặp; 100 câu test.
+  - Chấm strict: Base 14%, SFT-CoT 65%, Sol-DPO 68% (Sol-DPO vs SFT-CoT p = 0,45).
+  - Chấm mù theo nội dung (v2): Base 74%, SFT-CoT 66%, Sol-DPO 68%. Chênh lệch kiểu strict chủ yếu do định dạng đáp án.
+  - DPO vẫn dùng lr 1e-6: thay đổi trọng số khoảng 1e-4, loss ≈ ln 2, 68/100 lời giải giống hệt SFT-CoT.
+  - 24/25 cặp reasoning-correction gán nhầm lời giải đúng là sai (bộ kiểm tra số học đọc sai "x", "$", dấu phẩy).
 
-Kế hoạch đánh giá USC-DPO đầy đủ (cấu hình, cỡ mẫu, ablation) nằm ở Mục 8 của `paper_usc_dpo.pdf`.
+Chi tiết và kế hoạch đánh giá USC-DPO đầy đủ: `paper_usc_dpo.pdf` (Mục 5–8). Nhãn chấm lại: `analysis/regrade_labels.csv` (Run A), `analysis/regrade_labels_runB.csv` (Run B).
