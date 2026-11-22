@@ -43,9 +43,10 @@
 
 \newcommand{\valid}{\texttt{<|step\_\allowbreak valid|>}}
 \newcommand{\invalid}{\texttt{<|step\_\allowbreak invalid|>}}
-\newcommand{\ind}{\mathbb{I}_{\text{invalid}}}
+\newcommand{\soldpo}{\textsc{Sol-DPO}}
 
-\title{\textbf{Learning to Verify: Self-Verification Training for Small Reasoning Models}}
+\title{\textbf{Learning to Verify: Self-Verification Training for Small Reasoning Models}\\[4pt]
+\large Framework Design and a Solution-Level DPO Pilot Study}
 
 \author{
     \textbf{Dinh-Hong Vu}$^{1[0000-0001-8513-3942]}$,
@@ -64,79 +65,76 @@
 \maketitle
 
 \begin{abstract}
-Small Language Models (SLMs) are attractive for on-device deployment, yet they fail on multi-step reasoning because errors compound along the chain of thought. Existing remedies either attach an external verifier, which roughly doubles memory consumption and adds latency, or ask the model to critique itself in free text, which is unreliable and verbose. We present USC-DPO (Unified Step-Filtered Contrastive Direct Preference Optimization), a framework that folds the \textit{Solve}, \textit{Verify} and \textit{Correct} phases into a single set of weights. The design combines three components: discrete status tokens for step-level verification, a Hard Context Truncation mechanism that evicts rejected steps from the KV cache, and the Local Contrastive Preference (LCP) algorithm that turns self-generated correct and incorrect solutions into step-aligned preference pairs. We also derive an analytical model that links verifier recall and false-alarm rate to end-to-end accuracy and token overhead. Finally, we report a first, deliberately reduced implementation: Qwen2.5-Math-1.5B with LoRA, 81 preference pairs built from 320 self-generated GSM8K solutions, and 243 DPO updates on a single Tesla T4 GPU. On 50 GSM8K test problems the resulting model is statistically indistinguishable from the base and SFT-CoT baselines, and the DPO loss remains close to $\ln 2$. We analyse the likely causes, document an answer-extraction defect in our own grader, and lay out the experiments required to test the full design.
+Small Language Models (SLMs) are attractive for on-device deployment, yet they fail on multi-step reasoning because errors compound along the chain of thought. External verifiers roughly double resident memory and add latency, and prompted self-correction is unreliable and verbose. We specify USC-DPO (Unified Step-Filtered Contrastive Direct Preference Optimization), a framework that places the \textit{Solve}, \textit{Verify} and \textit{Correct} phases in a single set of weights. Its components are discrete status tokens emitted after each step, Hard Context Truncation of rejected steps in the KV cache, and the Local Contrastive Preference (LCP) procedure, which turns self-generated solutions into step-aligned pairs for content and balanced pairs for verification. We revise our earlier objective, which attached the error tag to the rejected sample and therefore taught the model \emph{not} to flag its errors, and we give a finite-budget analysis that links verifier recall and false-alarm rate to end-to-end accuracy. This report does \emph{not} yet evaluate USC-DPO. Its experiment is a pilot of plain solution-level DPO (\soldpo{}) on Qwen2.5-Math-1.5B with 81 pairs. Weight diagnostics show the pilot barely moved the model: the relative weight change was about $10^{-4}$, and on 33 of 50 GSM8K test problems the greedy output is character-identical to the base model. Accuracy is indistinguishable across Base, SFT-CoT and \soldpo{} (37/50 each under a blind rule-based grader). With 50 problems, only differences of about 12 points are detectable. We therefore report the pilot as a validation of the pipeline and the grading procedure, and we specify the configuration, sample size and ablations needed to test the framework.
 \end{abstract}
 
-\noindent\textbf{Keywords:} Small Language Models, Chain-of-Thought, Self-Verification, Self-Correction, Direct Preference Optimization (DPO), Step-Filtering.
+\noindent\textbf{Keywords:} Small Language Models, Chain-of-Thought, Self-Verification, Self-Correction, Direct Preference Optimization (DPO), Step-level preference learning.
 
 %==============================================================
 \section{Introduction}
 %==============================================================
-Deploying Small Language Models (SLMs, here: fewer than 13B parameters) on local hardware has become a priority for reducing operating cost and keeping user data private. Nevertheless, on multi-step reasoning tasks solved through Chain-of-Thought (CoT) prompting, SLMs fail disproportionately. A single faulty intermediate step corrupts every step that depends on it, and the final answer inherits the error~\cite{wei2022chain}. We call this phenomenon \emph{compounding error}; Section~\ref{sec:prelim} quantifies it.
+Deploying Small Language Models (SLMs, here: fewer than 13B parameters) on local hardware reduces cost and keeps user data private. On multi-step reasoning with Chain-of-Thought (CoT) prompting, however, SLMs fail disproportionately: one faulty intermediate step corrupts every step that depends on it~\cite{wei2022chain}. We call this \emph{compounding error} and quantify it in Section~\ref{sec:prelim}.
 
-The two dominant remedies carry heavy trade-offs. The first attaches an external verifier, such as an outcome reward model~\cite{cobbe2021training} or a process reward model (PRM)~\cite{lightman2023let}, and uses it to rank candidate solutions or to guide tree search. This improves accuracy, but a generator and a verifier must be resident in memory simultaneously, and many candidates must be sampled and scored, which inflates latency~\cite{lightman2023let}. The second remedy prompts the model to inspect and repair its own output (soft self-correction). Without external feedback, however, models often turn correct answers into incorrect ones, and they emit long commentary that occupies the context window~\cite{huang2023large, tyen2023llms}. Studies of ``aha moments'' further suggest that much apparent self-checking is decorative and has little effect on the final answer~\cite{zhao2025aha}.
+Two remedies dominate. The first adds an external verifier, an outcome reward model~\cite{cobbe2021training} or a process reward model (PRM)~\cite{lightman2023let, wang2024mathshepherd}, to rerank samples or guide search. Accuracy improves, but generator and verifier must both be resident in memory, and many candidates must be scored. The second remedy prompts the model to critique and repair its own output. Without external feedback, models often turn correct answers into incorrect ones~\cite{huang2023large}, they are poor at locating their own errors~\cite{tyen2024llms}, and much apparent self-checking is decorative~\cite{zhao2025aha}.
 
-This paper explores a third route in which the verification skill is \emph{trained into} the generator. USC-DPO (Unified Step-Filtered Contrastive Direct Preference Optimization) unifies the \textit{Solve $\rightarrow$ Verify $\rightarrow$ Correct} loop inside one set of weights, following the preference-optimization view of DPO~\cite{rafailov2023direct}. Its two core mechanisms are:
-\begin{itemize}
-    \item[(i)] \textbf{Hard Context Truncation.} Instead of free-text critiques, the model emits a concise status token (\valid{} or \invalid{}) after each step. On \invalid{}, the faulty branch is removed from the KV cache and decoding resumes from the last verified prefix.
-    \item[(ii)] \textbf{Recycled contrastive data.} The LCP algorithm locates the first point at which a correct and an incorrect solution diverge and converts the pair into a step-level preference example, without manual annotation.
-\end{itemize}
+A third route trains the verification skill into the generator. Recent evidence supports this direction: Chen et al.~\cite{chen2026selfverify} found that training a model only to judge its own solutions improved generation to a level comparable with generation training, whereas generation training did not improve self-judgment. USC-DPO pursues this route at step granularity. After each step the model emits a status token (\valid{} or \invalid{}). On \invalid{}, the step is removed from the KV cache and resampled. Training data come from the model's own correct and incorrect solutions.
+
+\paragraph{Scope of this report.} The full framework has not yet been implemented. The experiment reported here trains plain DPO on 81 solution-level pairs and does not use status tokens, truncation or step-level pairs. We label this model \soldpo{} and do not present its results as evidence about USC-DPO.
 
 \paragraph{Contributions.}
 \begin{enumerate}
-    \item We specify the USC-DPO framework, including the status-token protocol, a decoding algorithm with truncation and a retry budget, and the LCP data-recycling procedure with two pair types (Sections~\ref{sec:method}).
-    \item We give an analytical model (Proposition~\ref{prop:eff}) showing how verifier recall and false-alarm rate determine effective step accuracy, end-to-end accuracy and token overhead, and we analyse the effect of the penalty term $\lambda$ on the DPO gradient (Proposition~\ref{prop:lambda}).
-    \item We identify and correct a placement issue in the rejected-sequence formulation (Remark~\ref{rem:tag}) and propose decoupled verification preference pairs as a refinement.
-    \item We report a reproducible, reduced implementation on GSM8K, including training dynamics, paired statistical comparisons, and an audit of answer extraction. The measured effect is not distinguishable from zero, and we state this plainly.
-    \item We derive testable hypotheses for the null result and a staged roadmap for evaluating the full design (Sections~\ref{sec:discussion} and~\ref{sec:conclusion}).
+    \item A specification of USC-DPO: the status-token protocol, decoding with truncation and a retry budget, and LCP with normalized step matching (Section~\ref{sec:method}).
+    \item A corrected training objective. Our earlier formulation appended \invalid{} to the rejected sample, so DPO \emph{lowered} the probability of flagging errors. The revised objective separates a step-content term from a balanced verification term (Section~\ref{sec:loss}).
+    \item An analysis of verified decoding under a finite retry budget $K$, with its assumptions stated explicitly (Proposition~\ref{prop:eff}).
+    \item A pilot study with weight-level diagnostics, a blind rule-based re-grading checked against manual labels, and a power analysis. Together they explain why the pilot could not detect an effect (Sections~\ref{sec:pilot}--\ref{sec:discussion}).
+    \item A concrete evaluation plan for the full framework: corrected hyperparameters, sample size, ablations and success criteria (Section~\ref{sec:plan}).
 \end{enumerate}
-
 
 %==============================================================
 \section{Related Work}
 \label{sec:related}
 %==============================================================
-\paragraph{Chain-of-Thought, test-time compute and verifiers.}
-Chain-of-Thought prompting~\cite{wei2022chain} elicits intermediate steps and underlies modern mathematical reasoning pipelines, and self-consistency~\cite{wang2023selfconsistency} samples several chains and returns the majority answer at the price of extra inference. GSM8K~\cite{cobbe2021training}, whose problems need two to eight steps, is a standard probe of multi-step arithmetic. Cobbe et al.\ trained outcome-level verifiers that rerank samples; Uesato et al.~\cite{uesato2022solving} compared process- and outcome-based feedback; and Lightman et al.~\cite{lightman2023let} showed that step-level supervision (PRM800K, about 800{,}000 step labels) beats outcome supervision when choosing among many samples. Their PRM scores a solution as the product of per-step correctness probabilities and supervises only up to the first incorrect step, a first-error principle that motivates our LCP algorithm. The price is a second model, human step labels and repeated sampling.
+\paragraph{CoT, test-time compute and verifiers.}
+Chain-of-Thought prompting~\cite{wei2022chain} elicits intermediate steps, and self-consistency~\cite{wang2023selfconsistency} votes over several sampled chains at extra inference cost. GSM8K~\cite{cobbe2021training} contains grade-school problems that need two to eight steps. Cobbe et al.\ trained outcome verifiers that rerank samples. Uesato et al.~\cite{uesato2022solving} compared process- and outcome-based feedback. Lightman et al.~\cite{lightman2023let} showed that step-level supervision (PRM800K, about 800{,}000 human step labels) beats outcome supervision for selecting among many samples, and they label only up to the first incorrect step. Math-Shepherd~\cite{wang2024mathshepherd} obtains step labels automatically by estimating, from sampled completions, whether a step can still reach the correct answer, and uses the resulting PRM for reranking and step-by-step PPO.
 
 \paragraph{Self-correction and self-verification.}
-Huang et al.~\cite{huang2023large} found that without external feedback models struggle to correct their reasoning and sometimes degrade. Tyen et al.~\cite{tyen2023llms} separated two abilities: models are poor at \emph{finding} reasoning errors but correct them well once the error location is given. Self-Refine~\cite{madaan2023selfrefine} iterates feedback and refinement by prompting, while Zhang et al.~\cite{zhang2024small} show that small models in particular need strong verifiers. Stechly et al.~\cite{stechly2025selfverification}, Lu et al.~\cite{lu2025verification} and Zhao et al.~\cite{zhao2025aha} document the limits of self-verification and the prevalence of decorative ``aha'' steps, and SCoRe~\cite{kumar2024score} trains self-correction with multi-turn reinforcement learning on self-generated data. These results imply that self-verification must be trained and that error location is the bottleneck.
+Huang et al.~\cite{huang2023large} found that models struggle to correct reasoning without external feedback. Tyen et al.~\cite{tyen2024llms} showed that models are poor at finding reasoning errors but can correct them when given the error location. Self-Refine~\cite{madaan2023selfrefine} iterates feedback and refinement through prompting. Zhang et al.~\cite{zhang2024small} argue that small models need strong verifiers to self-correct. Stechly et al.~\cite{stechly2025selfverification} and Lu et al.~\cite{lu2025verification} document the limits of self-verification. SCoRe~\cite{kumar2025score} trains self-correction with multi-turn reinforcement learning on self-generated data.
 
-\paragraph{Learning from own outputs and preference optimization.}
-STaR~\cite{zelikman2022star} fine-tunes on self-generated rationales that reach correct answers. RLHF with PPO~\cite{ouyang2022training, schulman2017ppo} optimizes a learned reward, whereas DPO~\cite{rafailov2023direct} learns directly from preference pairs. For verifiable domains, RLVR with GRPO~\cite{shao2024deepseekmath} powers systems such as DeepSeek-R1~\cite{deepseek2025r1}. We select DPO because it trains offline on fixed pairs on a single mid-range GPU.
+\paragraph{Preference optimization and step-level variants.}
+DPO~\cite{rafailov2023direct} learns from preference pairs without an explicit reward model. Offset-based variants require a minimum margin between chosen and rejected samples: ODPO~\cite{amini2024odpo} uses a pair-dependent offset, and SimPO~\cite{meng2024simpo} uses a target reward margin with a length-normalized, reference-free reward. For mathematical reasoning, Step-DPO~\cite{lai2024stepdpo} treats individual reasoning steps as the unit of preference, using self-generated data. Step-Controlled DPO~\cite{lu2024scdpo} builds negatives that begin to err at a specified step. RLVR with GRPO~\cite{shao2024deepseekmath} underlies DeepSeek-R1~\cite{deepseek2025r1}, and STaR~\cite{zelikman2022star} bootstraps rationales from correct answers.
 
-\paragraph{Concurrent work: training models to self-verify.}
-A concurrent preprint under review~\cite{anonymous2026selfverify} reports an asymmetry: improving generation did not improve a model's judgment of its own solutions, whereas training a model solely to judge the correctness of its own solutions with GRPO improved generation to a level comparable with generation training. For Qwen2.5-1.5B-Instruct, verification-only training also shortened reasoning (1604 to 1227 tokens on average, with average accuracy 20.2\% to 21.7\%), and alternating verification and generation phases worked best. Their target is a solution-level correct/incorrect judgment trained with RLVR, whereas USC-DPO verifies at step granularity with status tokens and learns from preference pairs (Table~\ref{tab:positioning}).
+\paragraph{Training models to self-verify.}
+Chen et al.~\cite{chen2026selfverify} report an asymmetry between generation and self-verification. Training Qwen2.5-Instruct models with GRPO solely to judge the correctness of their own solutions matched generation training in accuracy and shortened reasoning; for the 1.5B model, average length fell from 1604 to 1227 tokens while average accuracy changed from 20.2\% to 21.7\%. Alternating verification and generation phases worked best. Their verifier judges whole solutions with a balanced correct/incorrect batch.
+
+\paragraph{Positioning.}
+The step-content part of USC-DPO is close to Step-DPO: both prefer a correct step to an incorrect one at the first point of divergence. We do not claim novelty for that component. The parts that differ are (i) an explicit, balanced verification objective on status tokens trained jointly with step content, and (ii) inference-time truncation driven by those tokens. Table~\ref{tab:positioning} summarizes.
 
 \begin{table}[t]
 \centering
-\caption{Positioning of USC-DPO relative to prior approaches.}
+\caption{Positioning of USC-DPO relative to closely related approaches.}
 \label{tab:positioning}
-\small
-\begin{tabularx}{\textwidth}{lXcccc}
+\footnotesize
+\begin{tabularx}{\textwidth}{lXccc}
 \toprule
-\textbf{Approach} & \textbf{Training or selection signal} & \textbf{No ext.\ verifier} & \textbf{Step-level} & \textbf{Single model} \\
+\textbf{Approach} & \textbf{Training signal} & \textbf{No ext.\ verifier} & \textbf{Step-level} & \textbf{Verification output} \\
 \midrule
-Outcome verifier~\cite{cobbe2021training} & Final-answer labels & -- & -- & -- \\
-PRM + search~\cite{lightman2023let} & Human step labels & -- & \checkmark & -- \\
-Prompted self-refinement~\cite{madaan2023selfrefine} & None (prompting) & \checkmark & -- & \checkmark \\
-STaR~\cite{zelikman2022star} & Correct-answer rationales & \checkmark & -- & \checkmark \\
-SCoRe~\cite{kumar2024score} & Outcome reward, multi-turn RL & \checkmark & -- & \checkmark \\
-Verification-only RL~\cite{anonymous2026selfverify} & Binary judgment reward & \checkmark & -- & \checkmark \\
-\textbf{USC-DPO (this work)} & Self-generated preference pairs & \checkmark & \checkmark & \checkmark \\
+PRM + search~\cite{lightman2023let} & Human step labels & -- & \checkmark & separate model \\
+Math-Shepherd~\cite{wang2024mathshepherd} & Automatic step labels & -- & \checkmark & separate model \\
+Step-DPO~\cite{lai2024stepdpo} & Step preference pairs & \checkmark & \checkmark & none \\
+SCDPO~\cite{lu2024scdpo} & Controlled-error negatives & \checkmark & \checkmark & none \\
+SCoRe~\cite{kumar2025score} & Outcome reward, multi-turn RL & \checkmark & -- & revision turn \\
+Self-verify RL~\cite{chen2026selfverify} & Binary judgment reward & \checkmark & -- & solution judgment \\
+\textbf{USC-DPO (proposed)} & Step pairs + balanced verification pairs & \checkmark & \checkmark & status token per step \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 %==============================================================
-\section{Preliminaries and Problem Formulation}
+\section{Preliminaries}
 \label{sec:prelim}
 %==============================================================
-\subsection{Notation}
-Let $x$ be a problem and $a^\ast$ its reference answer. A solution is a chain $y=(s_1,\dots,s_n)$ of reasoning steps, from which a final answer $a(y)$ is extracted. A policy $\pi_\theta$ generates $y$ autoregressively, and the outcome reward is $r(x,y)=\mathbb{1}[a(y)=a^\ast]$. We write $\pi_{\text{ref}}$ for the frozen reference policy, and $\sigma$ for the logistic sigmoid.
-
-\subsection{Compounding error}
-Let $p_t$ denote the probability that step $s_t$ is correct given that the prefix is correct. If a step error invalidates the chain, then $\Pr[\text{all steps correct}]=\prod_{t=1}^{n}p_t$, which for constant $p$ equals $p^{n}$ (Figure~\ref{fig:compound}). With $p=0.95$ and $n=8$ the chain is correct only 66\% of the time, and with $p=0.90$ only 43\%. Real errors are worse than this independence assumption suggests, because later steps condition on earlier faulty ones. Early error detection therefore matters more than late repair.
+\subsection{Notation and compounding error}
+Let $x$ be a problem with reference answer $a^\ast$, and $y=(s_1,\dots,s_n)$ a solution of $n$ steps with extracted answer $a(y)$. A policy $\pi_\theta$ generates $y$ autoregressively; $\pi_{\text{ref}}$ is a frozen reference policy and $\sigma$ the logistic sigmoid. If step $s_t$ is correct with probability $p_t$ given a correct prefix, and any step error invalidates the chain, then $\Pr[\text{chain correct}]=\prod_t p_t$, which equals $p^{n}$ for constant $p$ (Figure~\ref{fig:compound}). With $p=0.95$ and $n=8$ the chain is correct 66\% of the time, and with $p=0.90$ only 43\%. This illustrative model assumes independent step errors.
 
 \begin{figure}[t]
 \centering
@@ -150,29 +148,30 @@ Let $p_t$ denote the probability that step $s_t$ is correct given that the prefi
 \legend{$p=0.98$, $p=0.95$, $p=0.90$}
 \end{axis}
 \end{tikzpicture}
-\caption{Probability that an $n$-step chain is entirely correct, $p^{n}$, for several per-step accuracies (illustrative model assuming independent step errors).}
+\caption{Probability that an $n$-step chain is entirely correct, $p^{n}$ (illustrative model with independent step errors).}
 \label{fig:compound}
 \end{figure}
 
 \subsection{Direct Preference Optimization}
-Given a preference dataset of tuples $(x,y_w,y_l)$, where $y_w$ is preferred to $y_l$, DPO~\cite{rafailov2023direct} starts from the KL-regularized objective $\max_{\pi}\ \mathbb{E}[r(x,y)]-\beta\,\mathrm{KL}(\pi\,\|\,\pi_{\text{ref}})$, whose optimum satisfies $\pi^\ast(y|x)\propto\pi_{\text{ref}}(y|x)\exp(r(x,y)/\beta)$. Inverting this relation expresses the reward through the policy, $r(x,y)=\beta\log\frac{\pi^\ast(y|x)}{\pi_{\text{ref}}(y|x)}+\beta\log Z(x)$. Under the Bradley--Terry model, $\Pr[y_w\succ y_l]=\sigma(r(x,y_w)-r(x,y_l))$, and the partition term $Z(x)$ cancels. The resulting loss is
+For preference tuples $(x,y_w,y_l)$ with $y_w$ preferred, DPO~\cite{rafailov2023direct} starts from the KL-regularized objective $\max_{\pi}\mathbb{E}[r(x,y)]-\beta\,\mathrm{KL}(\pi\,\|\,\pi_{\text{ref}})$, whose optimum satisfies
+\[ r(x,y)=\beta\log\frac{\pi^\ast(y|x)}{\pi_{\text{ref}}(y|x)}+\beta\log Z(x). \]
+Under the Bradley--Terry model the partition term cancels:
 \begin{equation}
-\mathcal{L}_{\text{DPO}}=-\mathbb{E}\Big[\log\sigma\big(\beta\,\Delta_\theta\big)\Big],\qquad
+\mathcal{L}_{\text{DPO}}=-\mathbb{E}\big[\log\sigma(\beta\,\Delta_\theta)\big],\qquad
 \Delta_\theta=\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)}-\log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}.
 \label{eq:dpo}
 \end{equation}
-We call $\beta\Delta_\theta$ the \emph{preference margin}. At initialization $\pi_\theta=\pi_{\text{ref}}$, so $\Delta_\theta=0$ and $\mathcal{L}_{\text{DPO}}=\ln 2\approx0.693$. This diagnostic value is used in Section~\ref{sec:results}.
+We call $\beta\Delta_\theta$ the \emph{preference margin}. At initialization $\pi_\theta=\pi_{\text{ref}}$, so the margin is $0$ and the loss is $\ln 2\approx 0.693$. A loss that stays near $\ln 2$ therefore means the policy has not separated chosen from rejected samples.
 
 %==============================================================
 \section{The USC-DPO Framework}
 \label{sec:method}
 %==============================================================
 \subsection{Three-state operation}
-USC-DPO controls generation at the granularity of reasoning steps through three functional states.
 \begin{itemize}
-    \item \textbf{Solve:} the model generates the next candidate step $s_t$.
-    \item \textbf{Verify:} immediately after $s_t$, the model emits one status token, \valid{} or \invalid{}, instead of descriptive prose.
-    \item \textbf{Correct:} on \invalid{}, decoding halts, the tokens of $s_t$ and the status token are purged, and the model resamples an alternative step from the last verified prefix.
+    \item \textbf{Solve:} generate the next candidate step $s_t$.
+    \item \textbf{Verify:} immediately after $s_t$, emit one status token, \valid{} or \invalid{}, instead of a free-text critique.
+    \item \textbf{Correct:} on \invalid{}, purge $s_t$ and its tag and resample a step from the last verified prefix.
 \end{itemize}
 
 \begin{figure}[t]
@@ -193,12 +192,12 @@ USC-DPO controls generation at the granularity of reasoning steps through three 
 \draw[arr] (trunc) |- (correct);
 \draw[arr] (correct) -| (solve);
 \end{tikzpicture}
-\caption{Closed-loop runtime of USC-DPO. A step is committed only after a \valid{} token. Otherwise its tokens are removed from the cache and a replacement step is resampled from the last verified prefix.}
+\caption{Closed-loop runtime of USC-DPO. A step is committed only after \valid{}; otherwise its tokens are evicted from the cache and a replacement is sampled from the last verified prefix.}
 \label{fig:architecture}
 \end{figure}
 
-\subsection{Status-token protocol and decoding with truncation}
-Two special tokens, \valid{} and \invalid{}, are added to the vocabulary and always follow a step delimiter. Algorithm~\ref{alg:decode} describes decoding with a retry budget $K$. The retry budget prevents infinite loops: after $K$ consecutive rejections the last candidate is committed so that generation always terminates, and the event is logged as a verification failure. \emph{Hard Context Truncation} means that the key-value states of a rejected step are discarded and decoding continues from the cached state of the verified prefix. In a standard decoder this amounts to cropping the cache to the verified length, a cheap metadata operation rather than a recomputation, and since rejected text never re-enters the context, errors cannot propagate through attention.
+\subsection{Decoding with Hard Context Truncation}
+Two special tokens are added to the vocabulary and always follow a step delimiter. Algorithm~\ref{alg:decode} decodes with a retry budget $K$. After $K$ attempts the last candidate is committed, so generation always terminates; the event is logged as a verification failure. Truncation discards the key-value states of the rejected step and resumes from the cached verified prefix. In a decoder-only transformer this is a crop of the cache to the verified length, not a recomputation. Rejected text never re-enters the context, so it cannot distract later steps.
 
 \begin{algorithm}[t]
 \caption{Step-level decoding with Hard Context Truncation}
@@ -210,11 +209,10 @@ Two special tokens, \valid{} and \invalid{}, are added to the vocabulary and alw
     \For{$k = 1,\dots,K$}
         \State $s \gets$ \textsc{SampleStep}($\pi_\theta, c$) \Comment{Solve}
         \State $v \gets$ \textsc{SampleStatusToken}($\pi_\theta, c \oplus s$) \Comment{Verify}
-        \If{$v=$ \valid{}}
-            \State \textbf{break}
-        \Else
-            \State \textsc{CropKVCache}($|c|$) \Comment{Truncate: restore verified prefix}
+        \If{$v=$ \valid{} \textbf{or} $k=K$}
+            \State \textbf{break} \Comment{commit; forced commit when $k=K$}
         \EndIf
+        \State \textsc{CropKVCache}($|c|$) \Comment{Truncate: restore verified prefix}
     \EndFor
     \State $c \gets c \oplus s$; \quad $t \gets t+1$
 \EndWhile
@@ -222,191 +220,172 @@ Two special tokens, \valid{} and \invalid{}, are added to the vocabulary and alw
 \end{algorithmic}
 \end{algorithm}
 
-\subsection{Analytical model of verified decoding}
-\label{sec:analysis}
-We model the verifier by its \emph{recall} $r=\Pr[\texttt{invalid}\mid\text{step wrong}]$ and its \emph{false-alarm rate} $f=\Pr[\texttt{invalid}\mid\text{step correct}]$. The metric FPR-V used in Section~\ref{sec:setup} equals $1-r$. Let $p$ be the per-step accuracy of the generator.
+\subsection{LCP: Local Contrastive Preference recycling}
+\label{sec:lcp}
+LCP harvests training signal from the model's own samples. For each problem, several solutions are sampled and labeled by comparing the extracted answer with the reference. For every problem with at least one correct solution $P$ and one incorrect solution $N$, LCP finds the first step at which they diverge (Algorithm~\ref{alg:lcp}). The step pair is close to Step-DPO~\cite{lai2024stepdpo}. LCP adds two verification pairs per divergence, which are balanced by construction.
 
-\begin{proposition}[Effective step accuracy]
-\label{prop:eff}
-Assume independent attempts and an unlimited retry budget. A step is committed after the first attempt that the verifier accepts. Then the committed step is correct with probability
-\begin{equation}
-p_{\text{eff}}=\frac{p(1-f)}{p(1-f)+(1-p)(1-r)},
-\label{eq:peff}
-\end{equation}
-and the expected number of attempts per step is $1/a$ with $a=p(1-f)+(1-p)(1-r)$.
-\end{proposition}
-\begin{proof}
-In one attempt, the step is accepted and correct with probability $p(1-f)$, accepted and wrong with probability $(1-p)(1-r)$, and rejected otherwise. Conditioning on acceptance gives Eq.~\eqref{eq:peff}. The number of attempts is geometric with success probability $a$.
-\end{proof}
+Exact string comparison declares equivalent but differently phrased steps divergent, which places the divergence too early. LCP therefore compares a normalized form $\textsc{Norm}(s)$: the ordered sequence of numeric values in $s$, with whitespace and units removed, falling back to lower-cased text when $s$ contains no number. This is a heuristic. Automatic step labels in the style of Math-Shepherd~\cite{wang2024mathshepherd}, which estimate whether a step can still reach the answer, are a stronger alternative that we plan to compare.
 
-Equation~\eqref{eq:peff} shows that the benefit depends mainly on recall $r$ and less on $f$ when $p$ is high, and that perfect recall ($r=1$) yields $p_{\text{eff}}=1$. A chain of $n$ steps is then correct with probability $p_{\text{eff}}^{\,n}$ instead of $p^{n}$. Table~\ref{tab:analytic} gives numerical examples. The token overhead from rejected attempts is moderate (about 12--16\% in the examples), because attempts per step are bounded by $1/a$.
+\begin{algorithm}[t]
+\caption{LCP: divergence detection and pair construction}
+\label{alg:lcp}
+\begin{algorithmic}[1]
+\Require Correct solution $P$, incorrect solution $N$ for the same problem $q$
+\Ensure Step pair $(x, s_w, s_l)$ and verification pairs $\mathcal{V}$
+\State $S_P \gets \textsc{SplitSteps}(P)$; \quad $S_N \gets \textsc{SplitSteps}(N)$
+\State $i \gets 0$
+\While{$i < \min(|S_P|, |S_N|)$ \textbf{and} $\textsc{Norm}(S_P[i]) = \textsc{Norm}(S_N[i])$}
+    \State $i \gets i + 1$
+\EndWhile
+\If{$i = \min(|S_P|, |S_N|)$} \Return $\varnothing$ \Comment{no step-level divergence}
+\EndIf
+\State $x \gets q \oplus \textsc{Join}(S_P[0:i])$ \Comment{shared verified prefix}
+\State $s_w \gets S_P[i]$; \quad $s_l \gets S_N[i]$ \Comment{status tag \emph{not} appended}
+\State $\mathcal{V} \gets \{(x\oplus s_w,\ \valid \succ \invalid),\ (x\oplus s_l,\ \invalid \succ \valid)\}$
+\State \Return $(x, s_w, s_l), \mathcal{V}$
+\end{algorithmic}
+\end{algorithm}
 
 \begin{table}[t]
 \centering
-\caption{Illustration of Proposition~\ref{prop:eff} for $p=0.90$ and $n=8$ steps. Without verification the chain is correct 43.0\% of the time.}
+\caption{Pairs produced by LCP for one divergence.}
+\label{tab:dpo_dataset}
+\small
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Pair} & \textbf{Context} & \textbf{Preference} \\
+\midrule
+Step content & problem $\oplus$ shared prefix & correct step $s_w$ $\succ$ incorrect step $s_l$ \\
+Verification (+) & problem $\oplus$ prefix $\oplus\, s_w$ & \valid{} $\succ$ \invalid{} \\
+Verification ($-$) & problem $\oplus$ prefix $\oplus\, s_l$ & \invalid{} $\succ$ \valid{} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Training objective}
+\label{sec:loss}
+\paragraph{Earlier formulation and its flaw.} Our earlier version appended \invalid{} to the rejected step and added a penalty $\lambda$:
+\begin{equation}
+\mathcal{L}_{\text{old}}=-\mathbb{E}\Big[\log\sigma\Big(\beta\log\tfrac{\pi_\theta(s_w|x)}{\pi_{\text{ref}}(s_w|x)}-\beta\log\tfrac{\pi_\theta(s_l\oplus\invalid|x)}{\pi_{\text{ref}}(s_l\oplus\invalid|x)}-\lambda\Big)\Big].
+\label{eq:old}
+\end{equation}
+Because $\log\pi_\theta(s_l\oplus\invalid|x)$ contains the term $\log\pi_\theta(\invalid\mid x\oplus s_l)$, and DPO pushes the rejected log-ratio \emph{down}, Eq.~\eqref{eq:old} lowers the probability of flagging an erroneous step, the opposite of the intended behavior. The constant $\lambda$ cannot fix this. With $z=\beta\Delta_\theta-\lambda$, the gradient is $-\sigma(\lambda-\beta\Delta_\theta)\,\beta\nabla_\theta\Delta_\theta$; $\lambda$ rescales the weight of each pair but leaves the direction of the update unchanged. Such an offset is the mechanism already studied in ODPO~\cite{amini2024odpo} and in the target margin of SimPO~\cite{meng2024simpo}, so we treat it as an optional hyperparameter rather than a contribution.
+
+\paragraph{Revised objective.} USC-DPO separates step content from verification:
+\begin{equation}
+\mathcal{L}_{\text{USC}}=\underbrace{-\mathbb{E}_{(x,s_w,s_l)}\big[\log\sigma(\beta\,\Delta^{\text{step}}_\theta-\delta)\big]}_{\text{step content}}
+\;\underbrace{-\;\mu\,\mathbb{E}_{(c,v_w,v_l)\in\mathcal{V}}\big[\log\sigma(\beta_v\,\Delta^{\text{ver}}_\theta)\big]}_{\text{verification}},
+\label{eq:usc}
+\end{equation}
+where $\Delta^{\text{step}}_\theta$ is the DPO log-ratio difference of Eq.~\eqref{eq:dpo} computed on step tokens only, $\Delta^{\text{ver}}_\theta=\log\frac{\pi_\theta(v_w|c)}{\pi_{\text{ref}}(v_w|c)}-\log\frac{\pi_\theta(v_l|c)}{\pi_{\text{ref}}(v_l|c)}$ is computed on the single status token, $\delta\ge 0$ is an optional ODPO-style offset, and $\mu$ weights the verification term. Because $\mathcal{V}$ contains one positive and one negative example per divergence, the verification data are balanced, which Chen et al.~\cite{chen2026selfverify} found important for verification training. A token-level cross-entropy on the status token is a simpler alternative to the second term; we will compare both.
+
+\subsection{Analysis of verified decoding with a finite budget}
+\label{sec:analysis}
+Let $p$ be the per-step accuracy of the generator, and describe the verifier by its \emph{recall} $r=\Pr[\invalid\mid\text{step wrong}]$ and \emph{false-alarm rate} $f=\Pr[\invalid\mid\text{step correct}]$. The metric FPR-V (Section~\ref{sec:plan}) equals $1-r$.
+
+\begin{proposition}[Effective step accuracy with retry budget $K$]
+\label{prop:eff}
+Assume that attempts at a prefix are independent draws with the same $(p,r,f)$, and that Algorithm~\ref{alg:decode} commits the first accepted attempt, or the $K$-th attempt if all are rejected. Let $a=p(1-f)+(1-p)(1-r)$ be the per-attempt acceptance probability and $q=1-a$. Then the committed step is correct with probability
+\begin{equation}
+p_{\text{eff}}(K)=p(1-f)\,\frac{1-q^{K-1}}{1-q}+q^{K-1}p,
+\label{eq:peff}
+\end{equation}
+and the expected number of attempts is $(1-q^{K})/(1-q)$. In particular $p_{\text{eff}}(1)=p$, and $p_{\text{eff}}(K)\to p(1-f)/a$ as $K\to\infty$.
+\end{proposition}
+\begin{proof}
+Attempt $k<K$ is committed if the first $k-1$ attempts were rejected and attempt $k$ is accepted; it is then correct with probability $p(1-f)$. Summing $q^{k-1}p(1-f)$ over $k=1,\dots,K-1$ gives the first term. If the first $K-1$ attempts are rejected (probability $q^{K-1}$), attempt $K$ is committed regardless of its tag and is correct with probability $p$. The expected number of attempts is $\sum_{k=1}^{K}q^{k-1}$.
+\end{proof}
+
+\begin{table}[t]
+\centering
+\caption{Proposition~\ref{prop:eff} for $p=0.90$ and $n=8$ steps; chain accuracy is $p_{\text{eff}}^{8}$ (\%). Without verification ($K=1$) it is 43.0\%. Values in parentheses are expected attempts per step.}
 \label{tab:analytic}
 \small
 \begin{tabular}{ccccc}
 \toprule
-Recall $r$ & False alarm $f$ & $p_{\text{eff}}$ & Chain accuracy $p_{\text{eff}}^{8}$ (\%) & Attempts per step \\
+Recall $r$ & False alarm $f$ & $K=2$ & $K=3$ & $K\to\infty$ \\
 \midrule
-0.50 & 0.10 & 0.942 & 61.9 & 1.16 \\
-0.70 & 0.05 & 0.966 & 75.9 & 1.13 \\
-0.90 & 0.05 & 0.988 & 91.1 & 1.16 \\
-0.95 & 0.02 & 0.994 & 95.6 & 1.13 \\
+0.50 & 0.10 & 58.9 (1.14) & 61.5 (1.16) & 61.9 (1.16) \\
+0.70 & 0.05 & 71.2 (1.12) & 75.3 (1.13) & 75.9 (1.13) \\
+0.90 & 0.05 & 82.7 (1.14) & 89.9 (1.15) & 91.1 (1.16) \\
+0.95 & 0.02 & 87.7 (1.11) & 94.7 (1.13) & 95.6 (1.13) \\
 \bottomrule
 \end{tabular}
 \end{table}
 
+Table~\ref{tab:analytic} shows that a small budget ($K=3$) recovers most of the asymptotic gain, and that the gain is governed mainly by recall.
 
-
-\paragraph{Memory and token cost.} An external verifier of the same size doubles the resident weights (for a 1.5B-parameter model in 16-bit precision, 3~GB $\rightarrow$ 6~GB before KV caches), whereas the unified model keeps one copy. Soft correction costs $T_{\text{solve}}+T_{\text{critique}}+T_{\text{revise}}$ tokens; status tokens replace the critique by one token per step plus the discarded attempts.
-
-\subsection{LCP: Local Contrastive Preference recycling}
-\label{sec:lcp}
-Manual step-level annotation is expensive~\cite{lightman2023let}. LCP harvests training signal from the model's own samples. First, several candidate solutions per problem are sampled by bootstrapping from the base model and labeled by comparing the extracted final answer with the reference answer. Next, for each problem with at least one correct and one incorrect solution, LCP finds the first step at which they diverge (Algorithm~\ref{alg:lcp}). The shared prefix becomes the context $x$, the correct step becomes the chosen sample, and the incorrect step with the \invalid{} tag becomes the rejected sample (Table~\ref{tab:dpo_dataset}). This follows the first-error principle of process supervision~\cite{lightman2023let}.
-
-\begin{table}[t]
-\centering
-\caption{Structure of contrastive preference pairs generated via LCP.}
-\label{tab:dpo_dataset}
-\begin{tabularx}{\textwidth}{p{0.22\textwidth}X}
-\toprule
-\textbf{Component} & \textbf{Technical specification and constraints} \\
-\midrule
-Context ($x$) & Problem statement (GSM8K / MATH-500) concatenated with the verified prefix up to the divergence point. \\
-\addlinespace
-Preferred ($y_w$) & \textbf{Chosen step:} the valid logical step that advances toward the ground-truth solution. \\
-\addlinespace
-Rejected ($y_l$) & \textbf{Rejected step:} the erroneous branch terminated with the penalty token \invalid{}. \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\begin{algorithm}[t]
-\caption{Step-level divergence detection (LCP) and token injection}
-\label{alg:lcp}
-\begin{algorithmic}[1]
-\Require Ground-truth solution trajectory $P$ (positive), erroneous solution trajectory $N$ (negative)
-\Ensure Formatted preference tuple $(x, y_w, y_l)$
-\State $Steps_P \gets \text{Regex.Split}(P, \text{"\textbackslash n"})$
-\State $Steps_N \gets \text{Regex.Split}(N, \text{"\textbackslash n"})$
-\State $idx \gets 0$
-\While{$idx < \min(\text{len}(Steps_P), \text{len}(Steps_N))$}
-    \If{$Steps_P[idx] \neq Steps_N[idx]$}
-        \State \textbf{break} \Comment{Locate first deductive divergence point}
-    \EndIf
-    \State $idx \gets idx + 1$
-\EndWhile
-\State $x \gets \text{Join}(Steps_P[0 : idx])$ \Comment{Shared context prefix}
-\State $y_w \gets Steps_P[idx]$ \Comment{Next valid step (chosen)}
-\State $y_l \gets Steps_N[idx] + \text{"\invalid{}"}$ \Comment{Erroneous step with error tag (rejected)}
-\State \Return $(x, y_w, y_l)$
-\end{algorithmic}
-\end{algorithm}
-
-\paragraph{Pair types.} We use two kinds of pairs. \emph{Answer-correction} pairs contrast a correct solution (chosen) with an incorrect one (rejected) for the same problem. \emph{Step-efficiency} pairs contrast two correct solutions, preferring the one with fewer redundant steps, with the aim of reducing token usage. Redundancy is detected with textual rules: introductory sentences that add no computation, and near-duplicate steps.
-
-\paragraph{Known weaknesses.} Algorithm~\ref{alg:lcp} compares steps as strings, so equivalent steps phrased differently are declared divergent and the divergence index is placed too early. Comparing normalized numeric values would reduce this noise. The step-efficiency heuristic likewise cannot prove that a removed step was mathematically redundant.
-
-\subsection{Loss function and the role of $\lambda$}
-Conventional DPO sums token log-probabilities over complete sequences, which dilutes the gradient over long reasoning chains and hides where the mistake occurred. USC-DPO evaluates the objective at the divergence boundary and adds a penalty coefficient $\lambda$ for error-indicator tokens:
-\begin{equation}
-\mathcal{L}_{\text{USC-DPO}}(\pi_\theta;\pi_{\text{ref}})=-\mathbb{E}_{(x,y_w,y_l)}\left[\log\sigma\left(\beta\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)}-\beta\log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}-\lambda\cdot\ind(y_l)\right)\right],
-\label{eq:usc}
-\end{equation}
-where $\ind(y_l)=1$ if the rejected sample ends with the error token and $0$ otherwise.
-
-\begin{proposition}[Effect of $\lambda$]
-\label{prop:lambda}
-Let $z=\beta\Delta_\theta-\lambda\ind$ and $\mathcal{L}=-\log\sigma(z)$. Then $\nabla_\theta\mathcal{L}=-\sigma(-z)\,\beta\,\nabla_\theta\Delta_\theta$. For pairs with $\ind=1$, the gradient weight is $\sigma(\lambda-\beta\Delta_\theta)$, which exceeds the DPO weight $\sigma(-\beta\Delta_\theta)$ for any $\lambda>0$, and the loss at $\Delta_\theta=0$ is $\log(1+e^{\lambda})$ instead of $\ln 2$.
-\end{proposition}
-Proposition~\ref{prop:lambda} shows that the $\lambda$ term acts as a margin offset: the model must separate chosen and rejected samples by $\beta\Delta_\theta>\lambda$ before the gradient weight falls to $1/2$. Larger $\lambda$ therefore sustains learning signal on pairs that contain an error token.
-
-\begin{remark}[Tag placement]
-\label{rem:tag}
-In Eq.~\eqref{eq:usc}, the log-probability of $y_l$ includes the tag \invalid{}, and DPO \emph{decreases} $\pi_\theta(y_l|x)$. Hence, the objective also lowers the probability of emitting \invalid{} after a wrong step, which is the opposite of the intended verification behavior. The $\lambda$ term does not cancel this effect: it only shifts the margin. We therefore propose \emph{decoupled verification preference pairs} as a refinement. For every divergence, compute the step preference with the status token \emph{excluded} from the log-ratios, and add two verification pairs with the step as context: $(x\oplus s_w,\ \valid{}\succ\invalid{})$ and $(x\oplus s_l,\ \invalid{}\succ\valid{})$. These pairs are balanced by construction, which echoes the balancing used in verification-only training~\cite{anonymous2026selfverify}. This refinement is part of our roadmap and was not evaluated in this report.
+\begin{remark}[Assumptions]
+\label{rem:assump}
+Generator and verifier are the same model, so a step the model gets wrong is also one it may fail to detect. This correlation is absorbed into $r$ and $f$ \emph{provided they are measured on the model's own steps}, which is how FPR-V is defined. The stronger assumption is independence across retries. Resampling at the same prefix tends to repeat the same misconception, so retries are positively correlated, and Eq.~\eqref{eq:peff} should be read as an optimistic estimate. A model in which a prefix is ``hard'' with some probability, and all retries at a hard prefix fail, would give a strictly smaller $p_{\text{eff}}$. Proposition~\ref{prop:eff} is therefore used to set targets for $r$ and $f$, not to predict accuracy.
 \end{remark}
 
+\paragraph{Memory and token cost.} An external verifier of the same size doubles resident weights (for 1.5B parameters in 16-bit precision, about 3~GB to 6~GB before KV caches). The unified model keeps one copy. Status tokens cost one token per step plus the tokens of discarded attempts, instead of a free-text critique.
+
 %==============================================================
-\section{Experimental Setup}
-\label{sec:setup}
+\section{Pilot Study: Solution-Level DPO}
+\label{sec:pilot}
 %==============================================================
-\subsection{Implemented configuration versus full design}
-The full design in Section~\ref{sec:method} has not been implemented end to end. The experiments reported here evaluate a deliberately reduced version, summarized in Table~\ref{tab:status}. In particular, no status token is generated and no truncation is applied at inference time, so the evaluated model is a DPO-tuned model trained on solution-level pairs. Results should be read as a first measurement of the data-recycling and preference-training pipeline, not as a test of the full framework.
+\subsection{What the pilot tests}
+The pilot checks the data-recycling, training and evaluation pipeline on a T4 GPU. It does not test USC-DPO (Table~\ref{tab:status}). The trained model is plain DPO on solution-level pairs, which we call \soldpo{}.
 
 \begin{table}[t]
 \centering
-\caption{Full design versus the configuration evaluated in this report.}
+\caption{Proposed framework versus the pilot configuration.}
 \label{tab:status}
 \small
 \begin{tabularx}{\textwidth}{lXX}
 \toprule
-\textbf{Component} & \textbf{Full design} & \textbf{Evaluated here} \\
+\textbf{Component} & \textbf{USC-DPO (proposed)} & \textbf{Pilot (\soldpo{})} \\
 \midrule
-Backbone & Qwen2.5-7B, QLoRA, vLLM bootstrapping & Qwen2.5-Math-1.5B~\cite{yang2024qwen25math}, LoRA \\
-Status tokens, truncation & Core mechanism & Not implemented \\
-Pair granularity & Step-level (LCP) & Solution-level pairs: answer-correction and step-efficiency \\
-Loss & DPO with penalty $\lambda$ & Standard DPO ($\lambda=0$), $\beta=0.1$ \\
-Step verification & Model-internal & Skipped; redundancy filtered with text rules \\
-Benchmarks & GSM8K, MATH-500 & 50 GSM8K test problems \\
-Metrics & Pass@1, CSR, FPR-V, ATpP & Accuracy, latency, generated tokens \\
+Backbone & Qwen2.5-Math-1.5B, later 7B & Qwen2.5-Math-1.5B~\cite{yang2024qwen25math} \\
+Status tokens, truncation & yes & no \\
+Pair granularity & step pairs + verification pairs & whole solutions \\
+Objective & Eq.~\eqref{eq:usc} & standard DPO, Eq.~\eqref{eq:dpo} \\
+Scale & thousands of problems & 81 pairs from 48 problems \\
+Evaluation & full GSM8K test, MATH-500, $\ge 3$ seeds & 50 GSM8K problems, 1 seed \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\subsection{Data}
-We use GSM8K~\cite{cobbe2021training} (7{,}473 training and 1{,}319 test problems). For bootstrapping we take the first 80 training problems and sample four solutions per problem from the Qwen2.5-Math-1.5B model (temperature 0.85, top-$p$ 0.95, at most 384 new tokens, per-problem seeds), giving 320 candidates. A rule-based parser extracts the final number and compares it with the reference answer. Candidates whose answer cannot be read are kept aside and are not labeled correct or incorrect. Labels stored at pair-construction time are checked by a second parser; label disagreements and unparsed answers after cleanup are counted in Section~\ref{sec:results}. Pairs are then formed according to Section~\ref{sec:lcp}.
+\subsection{Data and training}
+We sampled four solutions for each of the first 80 GSM8K training problems from Qwen2.5-Math-1.5B (temperature 0.85, top-$p$ 0.95, at most 384 new tokens), giving 320 candidates. A rule-based parser labeled 241 as correct and 61 as incorrect; 18 had no readable answer and were left unlabeled. The 81 pairs comprise 61 \emph{answer-correction} pairs (correct $\succ$ incorrect solution) and 20 \emph{step-efficiency} pairs (both correct, shorter $\succ$ longer, with redundancy detected by text rules). They come from 48 distinct problems.
 
-\subsection{Models and training}
-Three models are compared. \textbf{Base} is Qwen2.5-Math-1.5B. \textbf{SFT-CoT} is the base model with a LoRA adapter~\cite{hu2022lora} trained for one epoch on 100 GSM8K solutions with a completion-only loss. \textbf{USC-DPO} (the reduced variant) starts from the SFT-CoT weights merged into the base, attaches a new LoRA adapter and is trained with DPO. Table~\ref{tab:hparams} lists the hyperparameters.
+Three models are compared. \textbf{Base} is Qwen2.5-Math-1.5B. \textbf{SFT-CoT} adds a LoRA adapter~\cite{hu2022lora} trained on 100 GSM8K solutions. \textbf{\soldpo{}} merges the SFT adapter into the base and trains a new LoRA adapter with DPO. Table~\ref{tab:hparams} lists the settings.
 
 \begin{table}[t]
 \centering
-\caption{Training configuration.}
+\caption{Pilot training configuration.}
 \label{tab:hparams}
 \small
 \begin{tabular}{lll}
 \toprule
-\textbf{Setting} & \textbf{SFT-CoT} & \textbf{DPO (USC-DPO, reduced)} \\
+\textbf{Setting} & \textbf{SFT-CoT} & \textbf{\soldpo{}} \\
 \midrule
 LoRA rank / $\alpha$ / dropout & 8 / 16 / 0.05 & 8 / 16 / 0.05 \\
 Target modules & q\_proj, v\_proj & q\_proj, v\_proj \\
-Training data & 100 GSM8K solutions & 81 preference pairs \\
-Epochs / optimizer steps & 1 / -- & 3 / 243 (one pair per step) \\
+Data & 100 solutions & 81 pairs \\
+Batch / optimizer steps & 1 $\times$ 4 accumulation / 25 & 1 / 243 (3 epochs) \\
 Learning rate & $2\times10^{-6}$ & $1\times10^{-6}$ \\
 $\beta$ & -- & 0.1 \\
-Sequence limits & 1024 tokens & prompt 256, completion 384 \\
-Gradient-norm clip & 1.0 & 1.0 \\
-Trainable parameters & -- & 1{,}089{,}536 ($\approx$0.07\%) \\
-Seed / hardware & -- & 42 / Tesla T4 \\
+Trainable parameters & 1{,}089{,}536 ($\approx$0.07\%) & 1{,}089{,}536 ($\approx$0.07\%) \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Evaluation protocol}
-All three models are evaluated on the first 50 GSM8K test problems with greedy decoding and a limit of 384 new tokens. We record the extracted answer, correctness, latency and generated tokens for each of the 150 generations. Accuracy intervals are Wilson 95\% intervals~\cite{wilson1927probable}, and paired model comparisons use the exact McNemar test~\cite{mcnemar1947note} on the discordant problems.
-
-\paragraph{Answer extraction and re-grading.} The original grader accepts a number after the \texttt{\#\#\#\#} marker or inside a boxed expression, and otherwise falls back to the number after ``the answer is'' or the last number on the last line. Manual inspection of the stored generations revealed cases where this fallback picks a number that is not the final answer (Section~\ref{sec:results}). We therefore also report accuracy after manually re-grading the 150 stored generations against the reference answer, treating a generation as incorrect when it is truncated before a final answer or when its stated final value differs from the reference. This re-grading was done by the authors, has not been cross-checked by an independent annotator, and should be viewed as provisional.
-
-\subsection{Metrics for the full design}
-\textbf{Pass@1}: fraction of problems solved by one greedy pass. \textbf{CSR} (Correction Success Rate): among instances where the model emits \invalid{}, the fraction ending in a correct solution. \textbf{FPR-V}: fraction of incorrect steps tagged \valid{}, i.e.\ $1-r$ in Section~\ref{sec:analysis}, with step correctness established by reference comparison or a programmatic arithmetic check. \textbf{ATpP}: average generated tokens per problem, where a 30--40\% reduction against standard self-correction is targeted. Only accuracy, latency and token counts are measured here.
+All models answer the first 50 GSM8K test problems with greedy decoding, the same prompt, and at most 384 new tokens. We grade with three procedures. \emph{Original:} the extractor used during the run, which falls back to an incidental number when no \texttt{\#\#\#\#} marker or boxed answer is present. \emph{Blind rule (v2):} a deterministic extractor applied to the 150 outputs in shuffled order without model identity. It takes, in order, a \texttt{\#\#\#\#} marker, a boxed answer, ``the answer is'', and otherwise the value after the last ``='' in the final sentence, or else the first number in that sentence. \emph{Manual:} the authors' reading of each output. The v2 rule was designed after inspecting failures on these same outputs, so its agreement with the manual labels is a consistency check, not an independent validation. Intervals are Wilson 95\%~\cite{wilson1927probable}, and paired comparisons use the exact McNemar test~\cite{mcnemar1947note}.
 
 %==============================================================
-\section{Results}
+\section{Pilot Results}
 \label{sec:results}
 %==============================================================
-\subsection{Preference data}
-Of 320 candidates, 241 were read as correct, 61 as incorrect and 18 had no readable answer. The 81 pairs consist of 61 answer-correction and 20 step-efficiency pairs from 48 distinct questions. During validation, 7 stored labels required a fallback during cleanup, and no pair remained unparsed or showed a label disagreement.
-
-
-
 \subsection{Training dynamics}
-Table~\ref{tab:train} reports the mean DPO loss and mean preference margin per epoch. Across the 243 steps the loss stays between 0.634 and 0.751 and the epoch means remain near $\ln 2=0.693$, while the mean margin is close to zero and returns to approximately zero in the third epoch. The margin is positive in 129 of 243 steps (53.1\%), which is barely above chance. As a consistency check of the implementation, step 1 has margin 0 and loss 0.6931, and step 3 has margin 0.1226 and loss 0.6337, in agreement with $-\log\sigma(\text{margin})$.
+Across the 243 steps, the DPO loss ranged from 0.634 to 0.751, and the epoch means stayed at $\ln 2$ (Table~\ref{tab:train}). The margin was positive in 129 of 243 steps (53.1\%). The implementation is consistent with Eq.~\eqref{eq:dpo}: step 1 has margin 0 and loss 0.6931, and step 3 has margin 0.1226 and loss 0.6337.
 
 \begin{table}[t]
 \centering
-\caption{Mean DPO loss, mean margin and fraction of steps with positive margin per epoch (81 steps each).}
+\caption{\soldpo{} training: mean loss, mean margin and fraction of steps with positive margin (81 steps per epoch).}
 \label{tab:train}
 \small
 \begin{tabular}{cccc}
@@ -420,182 +399,210 @@ Table~\ref{tab:train} reports the mean DPO loss and mean preference margin per e
 \end{tabular}
 \end{table}
 
-\subsection{Accuracy}
-Table~\ref{tab:acc} gives accuracy on the 50 test problems. With the original grader, Base, SFT-CoT and USC-DPO answer 30, 32 and 30 problems correctly (60\%, 64\%, 60\%). After manual re-grading the counts are 37, 38 and 37 (74\%, 76\%, 74\%). The re-grading corrected 7, 6 and 7 problems respectively, typically because the grader picked a quantity from the last sentence that was not the final answer. The ordering is nearly the same under both gradings, and the 95\% Wilson intervals overlap almost completely, with half-widths of about 12 percentage points.
+\subsection{Did the adapters change the model?}
+We measured the update directly. For each adapted matrix, the LoRA update is $\Delta W=\tfrac{\alpha}{r}BA$. We compared $\|\Delta W\|_F$ with $\|W\|_F$ of the corresponding base matrix for the q and v projections of layers 0, 9, 18 and 27 (Table~\ref{tab:diag}). The relative change is of order $10^{-5}$ for SFT-CoT and $10^{-4}$ for \soldpo{}. When the SFT adapter is merged into a 16-bit backbone, as was done before DPO training, only 0.7\% (bfloat16) to 5.2\% (float16) of the entries in these matrices change value at all. At the output level, greedy generations are character-identical to the base model on 33 of 50 problems for both SFT-CoT and \soldpo{}.
 
 \begin{table}[t]
 \centering
-\caption{Accuracy on 50 GSM8K test problems, with 95\% Wilson intervals.}
-\label{tab:acc}
+\caption{Size of the learned updates and output agreement. Relative change is $\|\Delta W\|_F/\|W\|_F$ over eight sampled q/v matrices.}
+\label{tab:diag}
 \small
-\begin{tabular}{lcccc}
+\begin{tabular}{lcc}
 \toprule
- & \multicolumn{2}{c}{\textbf{Original grader}} & \multicolumn{2}{c}{\textbf{Manually re-graded}} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}
-\textbf{Model} & Correct & Accuracy (CI) & Correct & Accuracy (CI) \\
+ & \textbf{SFT-CoT} & \textbf{\soldpo{}} \\
 \midrule
-Base & 30/50 & 60.0\% (46.2--72.4) & 37/50 & 74.0\% (60.4--84.1) \\
-SFT-CoT & 32/50 & 64.0\% (50.1--75.9) & 38/50 & 76.0\% (62.6--85.7) \\
-USC-DPO (reduced) & 30/50 & 60.0\% (46.2--72.4) & 37/50 & 74.0\% (60.4--84.1) \\
+Mean $\|\Delta W\|_F$ (56 matrices) & $1.0\times10^{-3}$ & $4.8\times10^{-3}$ \\
+Relative change, mean (max) & $2.4\times10^{-5}$ ($3.5\times10^{-5}$) & $1.0\times10^{-4}$ ($1.9\times10^{-4}$) \\
+Outputs identical to Base & 33/50 & 33/50 \\
+Same extracted answer as Base & 44/50 & 42/50 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
+These figures follow from the configuration. With a learning rate of $10^{-6}$, Adam changes each parameter by at most about $10^{-6}$ per step, so 25 to 243 steps cannot move $B$, which starts at zero, far from zero. The observed maxima, $\max|B|=2.5\times10^{-5}$ for SFT-CoT and $2.1\times10^{-4}$ for \soldpo{}, are close to these bounds ($5\times10^{-5}$ and $2.4\times10^{-4}$), so the size of the update was limited by the learning rate. LoRA fine-tuning typically uses learning rates on the order of $10^{-4}$; QLoRA, for example, used $1$--$2\times10^{-4}$~\cite{dettmers2023qlora}. A null result was therefore expected before evaluation, and the SFT-CoT baseline is in practice also very close to Base.
 
+\subsection{Accuracy}
+Table~\ref{tab:acc} reports the three gradings. The v2 rule and the manual labels agree on 149 of 150 outputs (Cohen's $\kappa=0.98$); the one disagreement is an SFT-CoT output whose final sentence contains both the answer and another number. Under every grading the three models are within one problem of each other. On v2 labels, the discordant problems split 1 vs.\ 1 (SFT-CoT vs.\ Base), 3 vs.\ 3 (\soldpo{} vs.\ SFT-CoT) and 2 vs.\ 2 (\soldpo{} vs.\ Base); every exact McNemar $p$-value is 1.0.
 
-In paired comparisons on the re-graded labels, SFT-CoT solves one problem that Base misses and none in the other direction; USC-DPO and SFT-CoT split 2 versus 3 discordant problems; USC-DPO and Base split 2 versus 2. All exact McNemar $p$-values equal 1.0, so there is no evidence that any model differs from another on this sample.
-
-
+\begin{table}[t]
+\centering
+\caption{Accuracy on 50 GSM8K test problems, with Wilson 95\% intervals.}
+\label{tab:acc}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Original grader} & \textbf{Blind rule (v2)} & \textbf{Manual (non-blind)} \\
+\midrule
+Base & 30/50, 60\% (46--72) & 37/50, 74\% (60--84) & 37/50, 74\% (60--84) \\
+SFT-CoT & 32/50, 64\% (50--76) & 37/50, 74\% (60--84) & 38/50, 76\% (63--86) \\
+\soldpo{} & 30/50, 60\% (46--72) & 37/50, 74\% (60--84) & 37/50, 74\% (60--84) \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Efficiency}
-Generated length is practically identical for the three models (mean 209.9, 212.4 and 212.6 tokens; median 192.5, 189.0 and 195.5), so the training did not shorten outputs. Mean latency is 7.72~s for Base and about 10.1~s for the two adapter-based models; we have not isolated the cause and make no claim about it. Four, five and three generations (Base, SFT-CoT, USC-DPO) reached the 384-token limit and therefore have no final answer.
+Mean generated length is 209.9, 212.4 and 212.6 tokens, and 4, 5 and 3 outputs reach the 384-token limit (Base, SFT-CoT, \soldpo{}). Mean latency is 7.72~s for Base and about 10.1~s for both adapter models. In the evaluation code, both adapter models run as unmerged PEFT wrappers, which add two low-rank products per adapted projection at every decoding step. LoRA adds no inference latency once merged~\cite{hu2022lora}, so the gap most likely reflects the unmerged evaluation rather than the models. We did not measure merged latency.
 
+\subsection{Statistical power}
+For a paired comparison, the number of problems needed to detect an accuracy difference $d$ at $\alpha=0.05$ with 80\% power is about $n\approx(z_{0.975}\sqrt{\pi_d}+z_{0.8}\sqrt{\pi_d-d^2})^2/d^2$, where $\pi_d$ is the fraction of discordant problems. In our pilot $\pi_d$ was 4--12\%. Table~\ref{tab:power} gives values. With $n=50$ and $\pi_d=0.10$, the minimum detectable difference is about 12 points. Detecting a 3-point difference needs roughly 520--870 problems, which the full GSM8K test set (1{,}319 problems) provides.
 
-
-\subsection{Grader audit}
-The audit exposed two systematic problems. First, \emph{wrong-number extraction}: in one problem a stored solution ends with ``Kylar needs to pay \$64 for 16 glasses'' and the reference answer is 64, but the extracted prediction was 16. In another, the text concludes that a person will be 109 years old, yet the extracted prediction was 10. Second, \emph{truncation}: generations cut at the token limit end in the middle of code or a derivation, so no answer is present and the extractor falls back to an unrelated number. Because the same grader is applied to all models, these errors do not bias the comparison in a known direction, but they add noise and make absolute accuracy unreliable. One borderline item (47.94 versus the reference 48, ``approximately 47.94 grams'') was counted as incorrect under exact matching. A more robust extractor should require an explicit final-answer marker and report outputs without one as ``no answer'' instead of guessing.
+\begin{table}[t]
+\centering
+\caption{Approximate number of problems for a paired test to detect difference $d$ ($\alpha=0.05$, power 0.8).}
+\label{tab:power}
+\small
+\begin{tabular}{lccc}
+\toprule
+Discordance $\pi_d$ & $d=2$ points & $d=3$ points & $d=5$ points \\
+\midrule
+0.06 & 1{,}175 & 521 & 186 \\
+0.10 & 1{,}960 & 870 & 312 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 %==============================================================
 \section{Discussion}
 \label{sec:discussion}
 %==============================================================
-\subsection{What the null result does and does not show}
-The data show that the reduced pipeline, with 81 pairs and 243 small updates, did not change model behavior in a way detectable on 50 problems. They do not show that USC-DPO is ineffective. First, the full mechanism was not implemented. Second, the confidence intervals are about $\pm12$ points wide, so only large effects could have been detected. Third, the training signal itself was weak: a loss pinned at $\ln 2$ means that the policy barely separated chosen from rejected samples (Section~\ref{sec:prelim}), so little change in downstream accuracy should be expected.
+\paragraph{What the pilot shows.} The pilot validates the pipeline end to end and uncovered a grading defect that shifted absolute accuracy by up to 14 points. Its accuracy comparison is uninformative for three separate reasons, any one of which would suffice: the trained model is not USC-DPO, the optimization barely changed the weights, and the sample can only detect differences of about 12 points. The pilot provides no evidence for or against USC-DPO.
 
-\subsection{Hypotheses and the experiments that would test them}
-Table~\ref{tab:hyp} lists plausible causes and a decisive experiment for each. These are hypotheses, not findings.
+\paragraph{Relation to verification-only training.} Chen et al.~\cite{chen2026selfverify} obtained gains from a verification objective with balanced data, which the pilot lacks entirely. This motivates the verification term in Eq.~\eqref{eq:usc}. Whether their result transfers from RLVR to offline preference learning is open.
+
+\paragraph{Threats to validity.} \emph{Internal:} the v2 grader was tuned on the same outputs, and manual labels were produced by the authors with knowledge of the model. \emph{External:} one model size, one benchmark, 50 problems, one seed. \emph{Construct:} GSM8K accuracy does not measure verification; that requires CSR and FPR-V on the model's own steps.
+
+\paragraph{Limitations.} LCP uses a heuristic normalization for step matching, the step-efficiency filter cannot prove that removed steps were redundant, and Proposition~\ref{prop:eff} assumes independent retries (Remark~\ref{rem:assump}). Verification training also adds training-time cost.
+
+%==============================================================
+\section{Evaluation Plan for USC-DPO}
+\label{sec:plan}
+%==============================================================
+\paragraph{Configuration.} Table~\ref{tab:plancfg} lists the planned settings. The main changes from the pilot are a learning rate two orders of magnitude higher, LoRA on all linear layers, larger batches and data, merged adapters for timing, and a stopping rule based on held-out preference accuracy rather than a fixed step count.
 
 \begin{table}[t]
 \centering
-\caption{Hypotheses for the null result and proposed tests.}
-\label{tab:hyp}
+\caption{Planned configuration (subject to a small learning-rate and $\beta$ sweep).}
+\label{tab:plancfg}
 \small
-\begin{tabularx}{\textwidth}{lXX}
+\begin{tabularx}{\textwidth}{lX}
 \toprule
-\textbf{ID} & \textbf{Hypothesis} & \textbf{Test} \\
+\textbf{Item} & \textbf{Setting} \\
 \midrule
-H1 & Too little data: 81 pairs from 48 problems. & Scale to several thousand problems and track margin and loss over steps. \\
-H2 & Label imbalance (241 correct versus 61 incorrect) and absence of an explicit verification objective. A concurrent study found that training on a balanced correct/incorrect judgment task helped generation~\cite{anonymous2026selfverify}. & Add decoupled verification pairs (Remark~\ref{rem:tag}) with 1:1 balance, then ablate. \\
-H3 & Weak optimization: learning rate $10^{-6}$, LoRA on two projections, $\beta=0.1$. & Grid over learning rate and $\beta$, and LoRA on all linear layers. \\
-H4 & Solution-level pairs dilute the step-level signal. & Replace with step-level LCP pairs and compare with the solution-level variant. \\
-H5 & Grader noise masks small gains. & Re-grade with a verified extractor and use at least 500 problems. \\
+Data & $\ge$ 2{,}000 GSM8K training problems $\times$ 8 samples; held-out 10\% of pairs \\
+SFT-CoT baseline & full GSM8K training set (7{,}473), LoRA, learning rate $\sim 10^{-4}$, 2--3 epochs \\
+Preference training & LoRA $r=16$ on all attention and MLP projections; learning rate in $\{10^{-5},5\times10^{-5},10^{-4}\}$; $\beta\in\{0.1,0.3\}$; effective batch 16--32 \\
+Training check & held-out preference accuracy $>$ 70\% and increasing margin before any test evaluation \\
+Evaluation & full GSM8K test (1{,}319) and MATH-500; greedy and 3 sampling seeds; merged adapters for latency \\
+Grading & v2 extractor frozen before evaluation; 10\% sample double-annotated blind to model, Cohen's $\kappa$ reported \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\subsection{Relation to verification-only training}
-The concurrent preprint~\cite{anonymous2026selfverify} reports that a verification-only reward can match generation training while shortening reasoning. Our reduced setup contains no verification task, only preferences over generations. If their finding transfers to preference learning, the missing ingredient in our experiment is the explicit verification target rather than the preference optimization itself. This is an untested conjecture about a preprint that is not yet peer reviewed.
+\paragraph{Ablations.} (A) SFT-CoT; (B) \soldpo{}; (C) step pairs only, a Step-DPO-style baseline~\cite{lai2024stepdpo}; (D) step and verification pairs, Eq.~\eqref{eq:usc}, decoded without truncation; (E) as D with Algorithm~\ref{alg:decode}, $K\in\{1,2,3\}$; (F) as D with the old objective Eq.~\eqref{eq:old}, to confirm the tag-placement effect.
 
-\subsection{Threats to validity and limitations}
-\emph{Internal:} the answer extractor is heuristic, and the manual re-grading was done by the authors without an independent check. \emph{External:} one model size, one benchmark and 50 problems limit generalization. \emph{Construct:} the evaluated model lacks status tokens and truncation, so GSM8K accuracy does not measure verification quality; CSR and FPR-V are needed for that. \emph{Statistical:} with this sample size, non-significance says little about small effects, and training used a single seed. Further limitations are the exact string matching in LCP (Section~\ref{sec:lcp}), the heuristic step-efficiency filter, the skipped semantic step verification, and the unresolved tag-placement issue (Remark~\ref{rem:tag}).
+\paragraph{Metrics.} \textbf{Pass@1}: accuracy of one greedy pass. \textbf{Verification accuracy}: accuracy of the status token on a balanced held-out set of the model's own steps. \textbf{FPR-V}: fraction of incorrect steps tagged \valid{} ($1-r$). \textbf{False alarm}: fraction of correct steps tagged \invalid{} ($f$). \textbf{CSR}: among instances with at least one \invalid{}, the fraction ending correct. \textbf{ATpP}: average generated tokens per problem, including discarded attempts. Step correctness for FPR-V is established by comparing intermediate values with a reference solution or by an arithmetic check.
+
+\paragraph{Hypotheses.} H1: D improves verification accuracy over C on held-out steps. H2: E improves Pass@1 over D for $K\ge2$, with gains consistent in direction with Table~\ref{tab:analytic} given the measured $r$ and $f$. H3: F yields lower recall $r$ than D. Each hypothesis is tested with paired tests on the full GSM8K test set.
 
 %==============================================================
-\section{Conclusion and Future Work}
+\section{Conclusion}
 \label{sec:conclusion}
 %==============================================================
-\subsection{Conclusion}
-We presented USC-DPO, a framework that integrates solving, verifying and correcting in a single model through status tokens, Hard Context Truncation and LCP data recycling, and we supported it with an analytical model of effective step accuracy and a gradient analysis of the penalty term. A first reduced implementation on a 1.5B-parameter model produced no measurable change on 50 GSM8K problems: the DPO loss stayed near $\ln 2$ and paired tests found no differences. The study is an honest baseline for the data-recycling and training pipeline, and it surfaced a grader defect and a formulation issue (Remark~\ref{rem:tag}) that would otherwise have confounded later results.
+We specified USC-DPO, a framework for step-level self-verification in a single small model, and corrected its objective so that the model is trained to flag, rather than suppress, its own errors. A finite-budget analysis shows that a retry budget of two or three recovers most of the attainable gain, and that recall on the model's own steps is the quantity that matters. Our pilot trained plain solution-level DPO and, by weight-level and output-level diagnostics, left the model nearly unchanged. Its null accuracy result is therefore uninformative about the framework. The value of the pilot lies in the working pipeline, a corrected grader checked against manual labels, and a sample-size requirement. Section~\ref{sec:plan} specifies the experiments that will test the framework itself.
 
-\subsection{Future work}
-We plan the following stages in order of priority.
-\begin{enumerate}
-    \item \textbf{Measurement hygiene.} Replace the answer extractor, re-grade all stored generations with a second annotator, and evaluate on at least 500 GSM8K problems with multiple seeds.
-    \item \textbf{Verification objective.} Add balanced verification pairs (Remark~\ref{rem:tag}) and test alternating generation and verification phases, motivated by recent evidence on verification-only training~\cite{anonymous2026selfverify}.
-    \item \textbf{Full mechanism.} Implement status tokens and cache truncation (Algorithm~\ref{alg:decode}), step-level LCP with normalized step matching, and the $\lambda$ term.
-    \item \textbf{Scale and breadth.} Move to Qwen2.5-7B with QLoRA~\cite{dettmers2023qlora} and vLLM~\cite{kwon2023vllm}, add MATH-500, and report Pass@1, CSR, FPR-V and ATpP against soft-correction and external-verifier baselines.
-\end{enumerate}
-
-\paragraph{Reproducibility.} We retain the training adapters, the 81 preference pairs, the per-step training log and the 150 stored generations, together with fixed seeds, so that the figures in this report can be recomputed offline.
+\paragraph{Reproducibility.} We release the notebook, the 81 pilot pairs, per-step training logs, both adapters, and the 150 stored generations with all three gradings.
 
 \appendix
 \section{Worked Example of LCP}
 \label{app:lcp}
-Consider the illustrative problem: ``A farmer's hens lay 16 eggs per day. She eats three, uses four for baking, and sells the rest at \$2 each. How much does she earn daily?'' 
-
-The correct solution $P$ has Step~1 ``$16-3-4=9$ eggs remain'' and Step~2 ``$9\times 2=18$ dollars''. The incorrect solution $N$ has the same Step~1 and Step~2 ``$9\times 3=27$ dollars''.
-
-Step~1 is identical and Step~2 differs, so $idx=1$ (zero-indexed). LCP returns the context $x=$ problem $\oplus$ ``$16-3-4=9$ eggs remain'', the chosen step $y_w=$ ``$9\times2=18$ dollars'' and the rejected step $y_l=$ ``$9\times3=27$ dollars'' followed by \invalid{}. Under the decoupled refinement of Remark~\ref{rem:tag}, two further pairs are added: $(x\oplus y_w,\ \valid{}\succ\invalid{})$ and $(x\oplus\text{``}9\times3=27\text{''},\ \invalid{}\succ\valid{})$.
+Problem: ``A farmer's hens lay 16 eggs per day. She eats three, uses four for baking, and sells the rest at \$2 each. How much does she earn daily?'' The correct solution $P$ has Step~1 ``$16-3-4=9$ eggs remain'' and Step~2 ``$9\times 2=18$ dollars''. An incorrect solution $N$ has the same Step~1 and Step~2 ``$9\times 3=27$ dollars''. The normalized forms of Step~1 are both $(16,3,4,9)$; those of Step~2 are $(9,2,18)$ and $(9,3,27)$, so the divergence is at Step~2. LCP returns the step pair with context $x=$ problem $\oplus$ Step~1, chosen ``$9\times2=18$ dollars'' and rejected ``$9\times3=27$ dollars'', together with the verification pairs $(x\oplus\text{``}9\times2=18\text{''},\ \valid\succ\invalid)$ and $(x\oplus\text{``}9\times3=27\text{''},\ \invalid\succ\valid)$.
 
 {\footnotesize\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}
 \begin{thebibliography}{99}
 
 \bibitem{wei2022chain}
-Wei, Jason, et al., ``Chain-of-thought prompting elicits reasoning in large language models,'' \textit{Advances in Neural Information Processing Systems}, vol. 35, pp. 24824--24837, 2022.
+Wei, J., et al., ``Chain-of-thought prompting elicits reasoning in large language models,'' in \textit{NeurIPS}, vol.~35, pp.~24824--24837, 2022.
 
 \bibitem{wang2023selfconsistency}
-Wang, Xuezhi, et al., ``Self-consistency improves chain of thought reasoning in language models,'' in \textit{ICLR}, 2023 (arXiv:2203.11171).
+Wang, X., et al., ``Self-consistency improves chain of thought reasoning in language models,'' in \textit{ICLR}, 2023 (arXiv:2203.11171).
 
 \bibitem{cobbe2021training}
-Cobbe, Karl, et al., ``Training verifiers to solve math word problems,'' \textit{arXiv preprint arXiv:2110.14168}, 2021.
+Cobbe, K., et al., ``Training verifiers to solve math word problems,'' arXiv:2110.14168, 2021.
 
 \bibitem{uesato2022solving}
-Uesato, Jonathan, et al., ``Solving math word problems with process- and outcome-based feedback,'' \textit{arXiv preprint arXiv:2211.14275}, 2022.
+Uesato, J., et al., ``Solving math word problems with process- and outcome-based feedback,'' arXiv:2211.14275, 2022.
 
 \bibitem{lightman2023let}
-Lightman, Hunter, et al., ``Let's verify step by step,'' \textit{arXiv preprint arXiv:2305.20050}, 2023.
+Lightman, H., et al., ``Let's verify step by step,'' in \textit{ICLR}, 2024 (arXiv:2305.20050).
+
+\bibitem{wang2024mathshepherd}
+Wang, P., et al., ``Math-Shepherd: Verify and reinforce LLMs step-by-step without human annotations,'' arXiv:2312.08935, 2023.
 
 \bibitem{huang2023large}
-Huang, Jie, et al., ``Large language models cannot self-correct reasoning yet,'' \textit{arXiv preprint arXiv:2310.01798}, 2023.
+Huang, J., et al., ``Large language models cannot self-correct reasoning yet,'' in \textit{ICLR}, 2024 (arXiv:2310.01798).
 
-\bibitem{tyen2023llms}
-Tyen, Gladys, et al., ``LLMs cannot find reasoning errors, but can correct them!,'' \textit{arXiv preprint arXiv:2311.08516}, 2023.
+\bibitem{tyen2024llms}
+Tyen, G., et al., ``LLMs cannot find reasoning errors, but can correct them given the error location,'' in \textit{Findings of ACL}, 2024 (arXiv:2311.08516).
 
 \bibitem{madaan2023selfrefine}
-Madaan, Aman, et al., ``Self-Refine: Iterative refinement with self-feedback,'' \textit{arXiv preprint arXiv:2303.17651}, 2023.
+Madaan, A., et al., ``Self-Refine: Iterative refinement with self-feedback,'' in \textit{NeurIPS}, vol.~36, 2023 (arXiv:2303.17651).
 
 \bibitem{zhang2024small}
-Zhang, Yunxiang, et al., ``Small language models need strong verifiers to self-correct reasoning,'' in \textit{Findings of ACL}, pp. 15637--15653, 2024.
+Zhang, Y., et al., ``Small language models need strong verifiers to self-correct reasoning,'' in \textit{Findings of ACL}, pp.~15637--15653, 2024.
 
 \bibitem{stechly2025selfverification}
-Stechly, Kaya, Valmeekam, Karthik, and Kambhampati, Subbarao, ``On the self-verification limitations of large language models on reasoning and planning tasks,'' in \textit{ICLR}, 2025.
+Stechly, K., Valmeekam, K., and Kambhampati, S., ``On the self-verification limitations of large language models on reasoning and planning tasks,'' in \textit{ICLR}, 2025.
 
 \bibitem{lu2025verification}
-Lu, Jack, Teehan, Ryan, Jin, Jinran, and Ren, Mengye, ``When does verification pay off? A closer look at LLMs as solution verifiers,'' \textit{arXiv preprint arXiv:2512.02304}, 2025.
+Lu, J., Teehan, R., Jin, J., and Ren, M., ``When does verification pay off? A closer look at LLMs as solution verifiers,'' arXiv:2512.02304, 2025.
 
 \bibitem{zhao2025aha}
-Zhao, Jiachen, Sun, Yiyou, Shi, Weiyan, and Song, Dawn, ``Can aha moments be fake? Identifying true and decorative thinking steps in chain-of-thought,'' \textit{arXiv preprint arXiv:2510.24941}, 2025.
+Zhao, J., Sun, Y., Shi, W., and Song, D., ``Can aha moments be fake? Identifying true and decorative thinking steps in chain-of-thought,'' arXiv:2510.24941, 2025.
 
-\bibitem{kumar2024score}
-Kumar, Aviral, et al., ``Training language models to self-correct via reinforcement learning,'' \textit{arXiv preprint arXiv:2409.12917}, 2024.
-
-\bibitem{zelikman2022star}
-Zelikman, Eric, et al., ``STaR: Bootstrapping reasoning with reasoning,'' \textit{Advances in Neural Information Processing Systems}, vol. 35, pp. 15476--15488, 2022.
-
-\bibitem{ouyang2022training}
-Ouyang, Long, et al., ``Training language models to follow instructions with human feedback,'' \textit{Advances in Neural Information Processing Systems}, vol. 35, 2022.
-
-\bibitem{schulman2017ppo}
-Schulman, John, et al., ``Proximal policy optimization algorithms,'' \textit{arXiv preprint arXiv:1707.06347}, 2017.
+\bibitem{kumar2025score}
+Kumar, A., et al., ``Training language models to self-correct via reinforcement learning,'' in \textit{ICLR}, 2025 (arXiv:2409.12917).
 
 \bibitem{rafailov2023direct}
-Rafailov, Rafael, et al., ``Direct preference optimization: Your language model is secretly a reward model,'' \textit{Advances in Neural Information Processing Systems}, vol. 36, 2023.
+Rafailov, R., et al., ``Direct preference optimization: Your language model is secretly a reward model,'' in \textit{NeurIPS}, vol.~36, 2023.
+
+\bibitem{amini2024odpo}
+Amini, A., Vieira, T., and Cotterell, R., ``Direct preference optimization with an offset,'' arXiv:2402.10571, 2024.
+
+\bibitem{meng2024simpo}
+Meng, Y., Xia, M., and Chen, D., ``SimPO: Simple preference optimization with a reference-free reward,'' in \textit{NeurIPS}, 2024 (arXiv:2405.14734).
+
+\bibitem{lai2024stepdpo}
+Lai, X., et al., ``Step-DPO: Step-wise preference optimization for long-chain reasoning of LLMs,'' arXiv:2406.18629, 2024.
+
+\bibitem{lu2024scdpo}
+Lu, Z., et al., ``Step-Controlled DPO: Leveraging stepwise error for enhanced mathematical reasoning,'' arXiv:2407.00782, 2024.
 
 \bibitem{shao2024deepseekmath}
-Shao, Zhihong, et al., ``DeepSeekMath: Pushing the limits of mathematical reasoning in open language models,'' \textit{arXiv preprint arXiv:2402.03300}, 2024.
+Shao, Z., et al., ``DeepSeekMath: Pushing the limits of mathematical reasoning in open language models,'' arXiv:2402.03300, 2024.
 
 \bibitem{deepseek2025r1}
-DeepSeek-AI, ``DeepSeek-R1: Incentivizing reasoning capability in LLMs via reinforcement learning,'' \textit{arXiv preprint arXiv:2501.12948}, 2025.
+DeepSeek-AI, ``DeepSeek-R1: Incentivizing reasoning capability in LLMs via reinforcement learning,'' arXiv:2501.12948, 2025.
 
-\bibitem{anonymous2026selfverify}
-Anonymous Authors, ``Learning to self-verify makes language models better reasoners,'' preprint under review at ICML (anonymous submission).
+\bibitem{zelikman2022star}
+Zelikman, E., et al., ``STaR: Bootstrapping reasoning with reasoning,'' in \textit{NeurIPS}, vol.~35, pp.~15476--15488, 2022.
+
+\bibitem{chen2026selfverify}
+Chen, Y., Wang, Y., Zhang, Y., Ye, Z., Cai, Z., Shi, Y., Gu, Q., Su, H., Cai, X., Wang, X., Zhang, A., and Chua, T.-S., ``Learning to self-verify makes language models better reasoners,'' arXiv:2602.07594, 2026.
 
 \bibitem{hu2022lora}
-Hu, Edward J., et al., ``LoRA: Low-rank adaptation of large language models,'' in \textit{ICLR}, 2022 (arXiv:2106.09685).
+Hu, E. J., et al., ``LoRA: Low-rank adaptation of large language models,'' in \textit{ICLR}, 2022 (arXiv:2106.09685).
 
 \bibitem{dettmers2023qlora}
-Dettmers, Tim, et al., ``QLoRA: Efficient finetuning of quantized LLMs,'' \textit{Advances in Neural Information Processing Systems}, vol. 36, 2023.
-
-\bibitem{kwon2023vllm}
-Kwon, Woosuk, et al., ``Efficient memory management for large language model serving with PagedAttention,'' in \textit{Proc.\ ACM SOSP}, 2023.
+Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer, L., ``QLoRA: Efficient finetuning of quantized LLMs,'' in \textit{NeurIPS}, vol.~36, 2023.
 
 \bibitem{yang2024qwen25math}
-Yang, An, et al., ``Qwen2.5-Math technical report: Toward mathematical expert model via self-improvement,'' \textit{arXiv preprint arXiv:2409.12122}, 2024.
+Yang, A., et al., ``Qwen2.5-Math technical report: Toward mathematical expert model via self-improvement,'' arXiv:2409.12122, 2024.
 
 \bibitem{wilson1927probable}
-Wilson, Edwin B., ``Probable inference, the law of succession, and statistical inference,'' \textit{Journal of the American Statistical Association}, vol. 22, no. 158, pp. 209--212, 1927.
+Wilson, E. B., ``Probable inference, the law of succession, and statistical inference,'' \textit{J.\ Amer.\ Statist.\ Assoc.}, vol.~22, no.~158, pp.~209--212, 1927.
 
 \bibitem{mcnemar1947note}
-McNemar, Quinn, ``Note on the sampling error of the difference between correlated proportions or percentages,'' \textit{Psychometrika}, vol. 12, no. 2, pp. 153--157, 1947.
+McNemar, Q., ``Note on the sampling error of the difference between correlated proportions or percentages,'' \textit{Psychometrika}, vol.~12, no.~2, pp.~153--157, 1947.
 
 \end{thebibliography}}
 
